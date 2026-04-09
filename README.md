@@ -15,7 +15,7 @@ This repo contains the raw assessment reports, WSTG checklists, PoC scripts, and
 |-------|-------------|
 | **Claude Code** | Anthropic's Claude — autonomous CLI agent |
 | **Codex** | OpenAI's Codex — autonomous CLI agent |
-| **Gwen** | Alibaba's Qwen — autonomous CLI agent |
+| **Qwen** | Alibaba's Qwen — autonomous CLI agent |
 
 ## Target Application
 
@@ -38,9 +38,9 @@ This repo contains the raw assessment reports, WSTG checklists, PoC scripts, and
 │   ├── wstg-assessment-whitebox-codex.md
 │   ├── blackbox_reports/
 │   └── whitebox_reports/
-└── gwen/
-    ├── wstg-assessment-blackbox-gwen.md
-    ├── wstg-assessment-whitebox-gwen.md
+└── qwen/
+    ├── wstg-assessment-blackbox-qwen.md
+    ├── wstg-assessment-whitebox-qwen.md
     ├── blackbox_reports/
     └── whitebox_reports/
 ```

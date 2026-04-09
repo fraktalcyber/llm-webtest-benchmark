@@ -703,7 +703,7 @@ Cryptography (CRYP): 1
 
 - **Platform**: macOS (darwin)
 - **Shell**: zsh
-- **Working Directory**: `/Users/user/src/wstg-bench-gwen`
+- **Working Directory**: `/Users/user/src/wstg-bench-qwen`
 - **Target**: `http://localhost:3000`
 - **Assessment Date**: 2026-04-01
 - **Total Tests**: 149 (100% coverage)
