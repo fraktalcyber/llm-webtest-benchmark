@@ -1,0 +1,354 @@
+{
+  "agent": "a09-logging",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a09-f01",
+      "title": "Log injection via unsanitized email in failed-login warning",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-117",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 87,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The failed-login warning concatenates the attacker-supplied email directly into the log message using string concatenation: `logger.warn('Failed login attempt for ' + email)`. Winston in development mode uses a Console transport with a simple (non-JSON) formatter, so CRLF characters in the email are emitted verbatim to the terminal. Even in production the JSON formatter will embed the raw string inside a JSON value — a CRLF followed by `}` and a crafted new JSON object forges an entirely new log entry in any downstream log parser that splits on newlines before parsing JSON (Logstash, Fluentd, many SIEM ingestion pipelines). An attacker can make the logs falsely record any user ID, IP address, or action.",
+      "evidence": {
+        "request": "curl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"attacker@evil.com\\nINFO: User authenticated: alice.admin@hireflow.com\",\"password\":\"x\"}'",
+        "code_snippet": "logger.warn('Failed login attempt for ' + email);",
+        "response_snippet": "401 {\"error\":\"Invalid email or password\"}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/login with email containing a literal newline and a forged log line.",
+        "Inspect server logs — the injected text appears as a separate log entry at INFO level attributed to any email the attacker chooses.",
+        "In JSON-line log processors that split on \\n before deserializing, the forged entry overwrites or supplements the real entry."
+      ],
+      "impact": "An attacker performing a credential-stuffing attack can sanitize the audit trail by injecting fake 'authenticated' lines for victim accounts, or forge evidence implicating other users. Forensic investigation of a breach becomes unreliable.",
+      "suggested_fix": "Use structured logging with a separate field rather than string interpolation: `logger.warn('Failed login attempt', { email, ip: req.ip })`. Winston's JSON formatter serializes fields safely so newlines inside the value are escaped as \\n.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f02",
+      "title": "Failed login does not log source IP address",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 87,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The `logger.warn('Failed login attempt for ' + email)` call records only the target email. The source IP address (`req.ip`) is never included. Similarly, the success path at line 91 logs `logger.info('User authenticated: ' + email)` with no IP. Without IP, an investigator cannot distinguish a brute-force attack from a legitimate forgotten-password scenario, cannot geolocate the attacker, and cannot correlate multiple failed attempts against different accounts from the same source (password-spray detection).",
+      "evidence": {
+        "code_snippet": "logger.warn('Failed login attempt for ' + email);\n// line 91:\nlogger.info('User authenticated: ' + email);"
+      },
+      "reproduction_steps": [
+        "Send multiple failed login attempts from the same IP.",
+        "Review logs — entries contain only the email, no IP.",
+        "Cross-account spraying from one IP is invisible in log analysis."
+      ],
+      "impact": "A password-spray or credential-stuffing attack cannot be reconstructed post-incident. The IP is the single most actionable data point for blocking and attribution.",
+      "suggested_fix": "Add `req.ip` (and optionally `req.get('x-forwarded-for')`) to every auth log entry: `logger.warn('Failed login attempt', { email, ip: req.ip })`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f03",
+      "title": "Password reset completion produces no audit log entry",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 188,
+        "endpoint": "POST /api/auth/reset-password"
+      },
+      "description": "The `resetPassword` function calls `authService.updatePassword(user.id, password)` and returns a 200 response, but emits no `logger.*` call and creates no `ActivityLog` entry for the event. The only logging on this path is a generic `logger.error` inside the catch block. An account takeover via compromised reset token — one of the most common account-takeover vectors — is completely invisible in the audit log.",
+      "evidence": {
+        "code_snippet": "await authService.updatePassword(user.id, password);\nres.json({ message: 'Password has been reset successfully. Please log in.' });\n// No logger call, no ActivityLog.create"
+      },
+      "reproduction_steps": [
+        "Trigger a password reset for any account.",
+        "Complete the reset via POST /api/auth/reset-password.",
+        "Check combined.log and MongoDB ActivityLog — no entry for the password change."
+      ],
+      "impact": "An attacker who compromises a reset token (via email interception, phishing, or the weak token algorithm — see A04) and changes the victim's password leaves no traceable event. DFIR cannot determine when the compromise occurred or from which IP.",
+      "suggested_fix": "After `updatePassword`, add: `logger.warn('Password reset completed', { userId: user.id, ip: req.ip })` and create an ActivityLog entry with action `password_reset_completed`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f04",
+      "title": "Password reset request (forgot-password) produces no audit log entry",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 134,
+        "endpoint": "POST /api/auth/forgot-password"
+      },
+      "description": "The `forgotPassword` function issues a reset token and sends a reset email, but there is no `logger.*` call and no `ActivityLog` entry. Reset-token requests are a high-value event: they reveal that an account is under attack, that a phishing campaign is targeting users, or that an attacker is probing for valid emails (the endpoint returns 404 for unknown emails, enabling enumeration). None of this is recorded.",
+      "evidence": {
+        "code_snippet": "const resetToken = generateResetToken(user.email);\nawait authService.setResetToken(user.id, resetToken);\n// ... sendEmail ...\nres.json({ message: 'Password reset link sent to your email' });\n// No logger call"
+      },
+      "impact": "Bulk enumeration of valid accounts and targeted password-reset attacks go undetected.",
+      "suggested_fix": "Add `logger.info('Password reset requested', { email, ip: req.ip })` after the token is set.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f05",
+      "title": "New account registration produces no audit log entry",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 30,
+        "endpoint": "POST /api/auth/register"
+      },
+      "description": "Account creation succeeds but neither `logger.*` nor `ActivityLog.create` is called on the success path. Only errors produce a log entry (`logger.error('Registration error:', err)`). Automated account creation — the first step in fake-account fraud, review manipulation, or platform abuse — is invisible until the abuse becomes apparent through other signals.",
+      "evidence": {
+        "code_snippet": "const user = await authService.createUser(...);\n// ... sendEmail ...\nres.status(201).json({ message: 'Registration successful...', token, user: sanitizeUser(user) });\n// No logger.info, no ActivityLog.create"
+      },
+      "impact": "Mass account registration campaigns (bots, fraudulent sellers) cannot be detected by log volume monitoring.",
+      "suggested_fix": "Add `logger.info('New user registered', { userId: user.id, email: user.email, role: userRole, ip: req.ip })` and an ActivityLog entry.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f06",
+      "title": "Wallet withdrawal produces no audit log or ActivityLog entry",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 79,
+        "endpoint": "POST /api/payments/withdraw"
+      },
+      "description": "The `withdraw` function debits the user wallet and records a transaction row, but does not call `logger.*` or `ActivityLog.create`. Compare with `deposit` (line 63) which does call `ActivityLog.create`, and `releaseEscrow` (line 294) which also does. The withdrawal path is the most financially sensitive: it removes real money from the platform. The asymmetry means an attacker who drains a wallet via IDOR or stolen session leaves no audit trail beyond a `transactions` row that they could potentially update if they gain DB access.",
+      "evidence": {
+        "code_snippet": "const [txn] = await db('transactions').insert({ ... type: 'withdrawal' ... }).returning('*');\nreturn { wallet: updated, transaction: txn };\n// No ActivityLog.create, no logger call"
+      },
+      "impact": "Financial fraud via unauthorized withdrawal is not flagged in the security audit log. Correlating suspicious withdrawal patterns across users requires a manual DB query rather than an automated alert.",
+      "suggested_fix": "Mirror the deposit pattern: add `ActivityLog.create({ user_id: userId, action: 'wallet_withdrawal', ... })` and `logger.info('Wallet withdrawal', { userId, amount, ip })` inside `withdraw()`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f07",
+      "title": "Escrow funding produces no ActivityLog entry (only a logger.info line)",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 195,
+        "endpoint": "POST /api/payments/escrow/fund/:milestoneId"
+      },
+      "description": "`fundEscrow` logs `logger.info('Escrow funded: milestone X, amount Y')` but does not create an `ActivityLog` document in MongoDB. The audit log endpoint (`GET /api/admin/audit-log`) queries MongoDB exclusively. An admin reviewing the audit log will see `escrow_released` events but never `escrow_funded` events, creating an incomplete financial picture: funds disappear from wallets without a corresponding audit record.",
+      "evidence": {
+        "code_snippet": "logger.info(`Escrow funded: milestone ${milestoneId}, amount ${amount}`);\nreturn updatedMilestone;\n// No ActivityLog.create — contrast with releaseEscrow which does call ActivityLog.create"
+      },
+      "impact": "The admin audit trail shows only one side of escrow transactions. Disputes about whether escrow was funded cannot be resolved from the audit log alone.",
+      "suggested_fix": "Add `ActivityLog.create({ user_id: userId, action: 'escrow_funded', resource_type: 'milestone', resource_id: milestoneId, ... })` matching the pattern used in `releaseEscrow`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f08",
+      "title": "Payment webhook accepts calls without a signature when header is absent (no log of unsigned calls)",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/integrations/webhook.service.js",
+        "line": 18,
+        "endpoint": "POST /api/webhooks/payment"
+      },
+      "description": "The webhook handler checks `if (signature)` — meaning if the `x-payment-signature` header is absent the signature check is skipped entirely and the payload is processed. This is a separate vulnerability (A01/A04 territory) but is relevant here because no log entry is produced when an unsigned webhook call arrives and is successfully processed. An attacker who fires unsigned webhook events to credit arbitrary wallets leaves only a normal `payment_received` ActivityLog entry that looks identical to a legitimate payment, with no indication that it arrived without a signature.",
+      "evidence": {
+        "code_snippet": "const signature = headers['x-payment-signature'];\nif (signature) {\n  // verify ...\n  if (signature !== expected) {\n    logger.warn('Payment webhook signature mismatch');\n    throw new Error('Invalid signature');\n  }\n}\n// No else branch — unsigned calls proceed silently"
+      },
+      "impact": "Unsigned webhook calls that credit wallets are indistinguishable in the audit log from legitimate signed calls. Post-incident analysis cannot determine whether a fraudulent payment was injected.",
+      "suggested_fix": "Reject calls with no signature: `if (!signature) { logger.warn('Unsigned webhook rejected', { ip: req.ip }); throw new Error('Missing signature'); }`. Also log when signature validation succeeds: `logger.info('Webhook signature verified', { event, reference_id })`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f09",
+      "title": "RBAC 403 denials are never logged — authorization failures are invisible",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/middleware/rbac.js",
+        "line": 30,
+        "endpoint": "All admin/moderator-protected routes"
+      },
+      "description": "The `requireRole`, `requireAdmin`, and `requireModerator` functions return a 403 response when a user's role is insufficient, but produce no log entry whatsoever. A `logger` import is not even present in this file. An attacker systematically probing admin endpoints (`GET /api/admin/dashboard`, `POST /api/admin/users/:id`, etc.) with a client-role JWT generates no log noise beyond Morgan's HTTP access log, which logs the 403 status code but not the authenticated user identity, the targeted resource, or the fact that it was a privilege-escalation attempt.",
+      "evidence": {
+        "code_snippet": "return res.status(403).json({ error: 'Insufficient permissions' });\n// No logger import, no logger call anywhere in rbac.js"
+      },
+      "reproduction_steps": [
+        "Obtain a client JWT (e.g. pentester_client_1@test.com).",
+        "Send GET http://localhost:3000/api/admin/dashboard with Authorization: Bearer <client-jwt>.",
+        "Observe 403 response. Check server logs — only Morgan's access line appears, no user-specific authorization-failure event."
+      ],
+      "impact": "An attacker enumerating admin APIs, attempting horizontal privilege escalation, or testing for IDOR across admin endpoints is effectively silent. Account-takeover reconnaissance that relies on probing admin routes leaves no trace.",
+      "suggested_fix": "Add logging inside `requireRole`: `const logger = require('../utils/logger'); ... logger.warn('Authorization denied', { userId: req.user.id, role: req.user.role, requiredRoles: roles, path: req.path, ip: req.ip });`",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f10",
+      "title": "Category create/update admin actions produce no audit log entry",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/admin/admin.controller.js",
+        "line": 203,
+        "endpoint": "POST /api/admin/categories, PUT /api/admin/categories/:id"
+      },
+      "description": "`createCategory` and `updateCategory` in admin.controller.js perform no logging and create no `ActivityLog` entry. Compare with `updateUser` (line 55), `deleteUser` (line 85), and `updateSettings` (line 178) which all call `ActivityLog.create`. Category changes affect search/discovery for all users — injecting a malicious category or modifying slugs could be used to corrupt SEO, redirect traffic, or as part of a more sophisticated attack. The absence of audit logging means such changes cannot be attributed.",
+      "evidence": {
+        "code_snippet": "const category = await adminService.createCategory({ name, slug, ... });\nres.status(201).json({ category });\n// No ActivityLog.create, no logger call\n\n// updateCategory similarly:\nres.json({ category });\n// No ActivityLog.create, no logger call"
+      },
+      "impact": "A compromised admin account creating fake categories or defacing category content cannot be reconstructed from logs.",
+      "suggested_fix": "Add `ActivityLog.create({ user_id: req.user.id, action: 'category_created', ... })` in both handlers, matching the pattern used for settings updates.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f11",
+      "title": "Morgan 'combined' format logs full request URLs including reset tokens in query strings",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-532",
+      "location": {
+        "file": "src/index.js",
+        "line": 55,
+        "endpoint": "GET /api/auth/verify-email/:token"
+      },
+      "description": "Morgan is configured with the `combined` format and piped into Winston: `app.use(morgan('combined', { stream: { write: msg => logger.info(msg.trim()) } }))`. The `combined` format includes the full request URI. Email verification tokens are passed as URL path segments (`GET /api/auth/verify-email/TOKENVALUE`) and are therefore written verbatim into `combined.log`. Password reset tokens are not in a GET URL (POST body), but if any future redirect or GET-based reset flow is added, the same issue applies. Anyone with read access to the log file can steal live verification tokens and verify arbitrary email addresses.",
+      "evidence": {
+        "code_snippet": "// src/index.js:55\napp.use(morgan('combined', { stream: { write: msg => logger.info(msg.trim()) } }));\n// Produces log line: GET /api/auth/verify-email/a3f8c2e1... 200 ...\n\n// auth.routes.js:\nrouter.get('/verify-email/:token', authController.verifyEmail);"
+      },
+      "impact": "A developer, ops engineer, or attacker with log access can extract live email-verification tokens and verify accounts they do not own. This enables spam-account activation at scale.",
+      "suggested_fix": "Add a Morgan `skip` or token-filter function that redacts path segments matching `/verify-email/[a-f0-9]+` before logging. Alternatively, change email verification to a POST with the token in the request body (body is not logged by Morgan).",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f12",
+      "title": "errorHandler logs full req.body on every unhandled error, capturing passwords on failed logins",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-532",
+      "location": {
+        "file": "src/middleware/errorHandler.js",
+        "line": 4,
+        "endpoint": "All endpoints"
+      },
+      "description": "The global error handler logs `body: req.body` as part of every error event: `logger.error(err.message, { stack: err.stack, url: req.originalUrl, method: req.method, body: req.body, user: req.user ? req.user.id : null })`. Winston writes to `combined.log` in JSON format. If an unhandled exception occurs during the login flow (e.g., a DB connection timeout after `const { email, password } = req.body` is destructured), the plaintext password is emitted to disk. During registration, both `password` and the computed `password_hash` are in scope and `req.body` still contains the plaintext password. The same issue applies to the payment endpoints where `req.body.amount` and `req.body.destination` (bank details) are exposed on error.",
+      "evidence": {
+        "code_snippet": "logger.error(err.message, {\n  stack: err.stack,\n  url: req.originalUrl,\n  method: req.method,\n  body: req.body,      // <-- full body including password field\n  user: req.user ? req.user.id : null\n});"
+      },
+      "impact": "Any transient infrastructure error during authentication causes plaintext passwords to be persisted in `combined.log` and readable by any process with access to the working directory.",
+      "suggested_fix": "Strip sensitive fields before logging: create a `sanitizeBody(body, sensitiveKeys)` helper that replaces values for keys matching `password`, `token`, `secret`, `card`, etc. with `'[REDACTED]'`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f13",
+      "title": "Log files written to application working directory with no access controls",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-532",
+      "location": {
+        "file": "src/utils/logger.js",
+        "line": 13,
+        "endpoint": "N/A"
+      },
+      "description": "Winston writes `error.log` and `combined.log` using relative filenames (no absolute path), meaning files are created in the Node.js process working directory (the repository root `/tmp/webvulnbench` in the container). There is no documented retention policy. Log rotation is not configured (no `winston-daily-rotate-file` or equivalent). Logs grow unbounded and are stored in the same directory tree as the application source. If an attacker achieves file-read access (path traversal, misconfigured static file serving, the already-noted `/uploads` directory listing), they could reach `../error.log` or `../combined.log` relative to the uploads path. Additionally, the same process that writes application code has write access to the log files, meaning an attacker with code execution can truncate or overwrite audit logs.",
+      "evidence": {
+        "code_snippet": "new winston.transports.File({ filename: 'error.log', level: 'error' }),\nnew winston.transports.File({ filename: 'combined.log' })"
+      },
+      "impact": "Audit logs can be destroyed by an attacker who achieves code execution. Logs may also contain sensitive data (see a09-f12) accessible via path traversal from the uploads endpoint.",
+      "suggested_fix": "Use absolute paths outside the web root (e.g., `/var/log/hireflow/`). Configure `winston-daily-rotate-file` with a retention period. Set file permissions so only the log-aggregation agent can read log files.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f14",
+      "title": "No alerting mechanism exists for any security event",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/",
+        "line": null,
+        "endpoint": "N/A"
+      },
+      "description": "A search across all source files finds no reference to any alerting, notification, or incident-response integration: no Sentry, PagerDuty, OpsGenie, Datadog, Splunk, or Slack webhook. The rate limiter (authLimiter) triggers a 429 response but fires no log entry and no alert. Repeated failed logins (brute force) generate individual `logger.warn` lines but there is no counter, threshold, or downstream hook that would page an on-call engineer. Account lockout is not implemented. The platform could be under active credential-stuffing attack and no human would be notified until a customer complaint arrived.",
+      "evidence": {
+        "code_snippet": "// rateLimiter.js — no onLimitReached callback, no logger call:\nconst authLimiter = rateLimit({\n  windowMs: 15 * 60 * 1000,\n  max: 20,\n  message: { error: 'Too many attempts, please try again later' }\n  // no handler, no onLimitReached\n});"
+      },
+      "impact": "Brute-force, credential-stuffing, and account-takeover campaigns can run undetected indefinitely. There is no mean-time-to-detect for authentication attacks.",
+      "suggested_fix": "At minimum, add an `onLimitReached` (or `handler`) callback to `authLimiter` that calls `logger.warn('Rate limit hit', { ip: req.ip, path: req.path })`. For production, integrate with an alerting service and implement account lockout after N consecutive failures.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f15",
+      "title": "ActivityLog (audit trail) stored in MongoDB with no tamper protection",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/models/ActivityLog.js",
+        "line": 1,
+        "endpoint": "N/A"
+      },
+      "description": "The ActivityLog Mongoose model uses a capped collection (`{ capped: { size: 104857600, max: 500000 } }`). MongoDB capped collections prevent document deletion and updates but do allow `findOneAndUpdate` / `updateOne` via the driver unless the collection is configured read-only for the application user. The application connects to MongoDB with a single connection string and the same credentials used for all reads and writes. There is no separate read-only audit user, no write-ahead log shipped off-host, and no cryptographic chaining of log entries. An attacker who achieves code execution on the application server can call `ActivityLog.updateOne({ action: 'admin_user_update' }, { $set: { description: '' } })` to retroactively suppress evidence of privilege escalation. Additionally, the 100MB cap means audit history is silently overwritten after approximately 500,000 events — there is no alert when the cap is reached.",
+      "evidence": {
+        "code_snippet": "const activityLogSchema = new mongoose.Schema({ ... }, {\n  capped: { size: 104857600, max: 500000 }\n});"
+      },
+      "impact": "A sophisticated attacker can erase or alter their own audit trail after gaining code execution. Forensic investigation of a breach relies on logs that can be modified by the breached process.",
+      "suggested_fix": "Ship audit logs to an append-only external store (CloudWatch Logs, Splunk, S3 with Object Lock) in real time. Use a dedicated MongoDB user with insert-only privileges for ActivityLog writes. Hash-chain log entries so tampering is detectable.",
+      "needs_poc": false
+    },
+    {
+      "id": "a09-f16",
+      "title": "Logout of JWT clients produces no audit log entry",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A09",
+      "cwe": "CWE-778",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 121,
+        "endpoint": "POST /api/auth/logout"
+      },
+      "description": "For JWT-only clients (the normal API flow), the logout handler returns a success message with a comment `// For JWT-only clients, logout is handled client-side`. No log entry is produced. Session-based logouts do call `req.session.destroy` but produce no Winston log on success (only on error). As a result, the audit trail has no record of when a session ended, making it impossible to determine whether a long-lived session was still active during a suspicious event.",
+      "evidence": {
+        "code_snippet": "} else {\n  // For JWT-only clients, logout is handled client-side\n  res.json({ message: 'Logged out successfully' });\n  // No logger call\n}"
+      },
+      "impact": "Session-end events are invisible. If a JWT is stolen and used for an extended period, there is no log entry showing the legitimate user's last logout, making the timeline of compromise harder to establish.",
+      "suggested_fix": "Add `logger.info('User logout', { userId: req.user ? req.user.id : 'unknown', ip: req.ip })` in both branches of the logout handler.",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Reviewed: logger.js (Winston config), index.js (Morgan setup), auth.controller.js (all 7 auth handlers), auth.service.js, middleware/rbac.js, middleware/rateLimiter.js, middleware/errorHandler.js, middleware/auth.js, payments.controller.js, payments.service.js (all 6 payment functions), admin.controller.js (all 15 admin handlers), admin.service.js, disputes.controller.js + disputes.service.js (full dispute lifecycle), integrations/webhook.service.js + webhook.routes.js, users.controller.js, models/ActivityLog.js. All security-relevant event classes checked: authentication (login success/fail/logout/register/forgot-password/reset-password/email-verify), authorization (403 denials), financial (deposit/withdraw/fund-escrow/release-escrow/dispute-resolution), admin actions (user CRUD/role change/settings/categories), webhook receipt. Log injection surface, sensitive data in logs, storage security, and alerting gaps all assessed from source.",
+  "blind_spots": [
+    "Did not test whether Morgan's combined format also captures POST body parameters (it does not by default — body logging requires a custom token).",
+    "Could not verify whether the Docker deployment sets NODE_ENV=production (which would disable the Console transport and change formatter); the errorHandler has a case-sensitivity bug comparing `process.env.NODE_ENV !== 'Production'` (capital P) so stack traces likely leak in all environments.",
+    "Did not check whether external log aggregation is configured at the infrastructure level (docker-compose log driver) — if stdout is shipped to a SIEM, the Winston Console transport (dev mode) findings become less severe."
+  ]
+}

@@ -1,0 +1,350 @@
+{
+  "agent": "a03-supply-chain",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a03-f01",
+      "title": "npm install used in CI instead of npm ci — lockfile integrity not enforced",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": ".github/workflows/ci.yml",
+        "line": 48
+      },
+      "description": "The CI 'Install dependencies' step runs `npm install` rather than `npm ci`. `npm install` will update package-lock.json and install whatever semver-compatible version is available at run time, not the version frozen in the lockfile. This means a dependency substitution or version-bump attack on any upstream package can silently flow into the CI build without lockfile drift being detected.",
+      "evidence": {
+        "code_snippet": "- name: Install dependencies\n  run: npm install"
+      },
+      "reproduction_steps": [
+        "Read .github/workflows/ci.yml line 48",
+        "Observe 'npm install' rather than 'npm ci'"
+      ],
+      "impact": "Any semver-compatible malicious release of a dependency (e.g. a patch-level poisoned release of lodash, express, or multer) will be installed in CI builds without any alert. Compromised builds can be silently promoted to production.",
+      "suggested_fix": "Replace `npm install` with `npm ci` in CI. Also replace `npm install` on both lines in Dockerfile with `npm ci`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f02",
+      "title": "npm install used in Dockerfile — lockfile integrity not enforced in container build",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "Dockerfile",
+        "line": 16
+      },
+      "description": "The Dockerfile uses `npm install` on line 16 (backend) and again on line 19 (`cd client && npm install`) rather than `npm ci`. Docker image builds therefore do not respect the committed lockfile, allowing the installed dependency tree to drift from the audited lockfile at any point a package is republished.",
+      "evidence": {
+        "code_snippet": "COPY package*.json ./\nRUN npm install\n\nCOPY client/package*.json ./client/\nRUN cd client && npm install"
+      },
+      "reproduction_steps": [
+        "Read Dockerfile lines 16 and 19"
+      ],
+      "impact": "Production Docker images may include different (potentially malicious or vulnerable) package versions than what is in the lockfile, without any build failure to indicate the drift.",
+      "suggested_fix": "Use `RUN npm ci` and `RUN npm ci --prefix client` respectively.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f03",
+      "title": "Security audit step has continue-on-error: true — npm audit failures are silently swallowed",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-693",
+      "location": {
+        "file": ".github/workflows/ci.yml",
+        "line": 67
+      },
+      "description": "The 'Security audit' step that runs `npm audit` is marked `continue-on-error: true`. This means any number of critical CVEs discovered by npm audit will not block the CI pipeline or mark the build as failed. The security gate is entirely decorative.",
+      "evidence": {
+        "code_snippet": "- name: Security audit\n  continue-on-error: true\n  run: npm audit"
+      },
+      "reproduction_steps": [
+        "Read .github/workflows/ci.yml lines 66-68"
+      ],
+      "impact": "Known-vulnerable dependencies (several are present in this repo, see related findings) will never block a deployment. Developers get no actionable signal from CI that the audit is failing.",
+      "suggested_fix": "Remove `continue-on-error: true` or replace with `npm audit --audit-level=high` and allow the step to fail the build.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f04",
+      "title": "GitHub Actions pinned to mutable version tags, not commit SHAs",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": ".github/workflows/ci.yml",
+        "line": 39
+      },
+      "description": "Both actions used in ci.yml are pinned to floating version tags (`actions/checkout@v4` at line 39 and `actions/setup-node@v4` at line 42) rather than immutable commit SHAs. A tag can be force-pushed by the action author (or an attacker who compromises the actions repository), silently replacing the code that runs in CI. The supply-chain attack against `actions/checkout` or `actions/setup-node` would gain full access to the CI runner including any secrets.",
+      "evidence": {
+        "code_snippet": "- uses: actions/checkout@v4\n...\n  uses: actions/setup-node@v4"
+      },
+      "reproduction_steps": [
+        "Read .github/workflows/ci.yml lines 39 and 42"
+      ],
+      "impact": "If either action repository is compromised, a tag push silently runs arbitrary code in all future CI builds with access to all repository secrets. This is the same class of attack as the tj-actions/changed-files supply-chain compromise (CVE-2025-30066).",
+      "suggested_fix": "Pin to full commit SHAs, e.g. `uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683` (v4.2.2).",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f05",
+      "title": "jsonwebtoken 8.5.1 — multiple CVEs (CVE-2022-23539, CVE-2022-23540, CVE-2022-23541)",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-327",
+      "location": {
+        "file": "package.json",
+        "line": 29
+      },
+      "description": "The resolved version of jsonwebtoken is exactly 8.5.1 (confirmed in package-lock.json line 5247). This version is affected by three CVEs disclosed in December 2022: CVE-2022-23539 (weak algorithm confusion — secretOrPublicKey accepts objects allowing algorithm confusion attacks), CVE-2022-23540 (improper signature validation in the special case where the 'none' algorithm is allowed), and CVE-2022-23541 (object injected via header claims can bypass verification). All three are fixed in v9.0.0. The application uses HS256 (per recon), but the algorithm-confusion surface is present.",
+      "evidence": {
+        "code_snippet": "\"node_modules/jsonwebtoken\": {\n  \"version\": \"8.5.1\""
+      },
+      "reproduction_steps": [
+        "Read package-lock.json line 5246-5249",
+        "Cross-reference with NVD: CVE-2022-23539, CVE-2022-23540, CVE-2022-23541"
+      ],
+      "impact": "Depending on how jwt.verify() is called, an attacker may be able to forge tokens or bypass signature verification. Coordinate with A01/A02 specialist for exploit chain against JWT auth.",
+      "suggested_fix": "Upgrade to jsonwebtoken >= 9.0.0. Also audit all jwt.verify() calls to ensure algorithm is explicitly specified.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f06",
+      "title": "multer 1.4.4 — deprecated with explicit CVE-2022-24434 notice in lockfile",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-400",
+      "location": {
+        "file": "package.json",
+        "line": 35
+      },
+      "description": "The resolved version of multer is 1.4.4 (package-lock.json line 5927). The npm registry itself has marked this version as deprecated with the message: 'Multer 1.x is affected by CVE-2022-24434. This is fixed in v1.4.4-lts.1'. CVE-2022-24434 is a denial-of-service vulnerability due to uncontrolled resource consumption when processing multipart form data. The fix is available in the LTS branch (1.4.4-lts.1) which this project has not adopted.",
+      "evidence": {
+        "code_snippet": "\"node_modules/multer\": {\n  \"version\": \"1.4.4\",\n  \"deprecated\": \"Multer 1.x is affected by CVE-2022-24434...\""
+      },
+      "reproduction_steps": [
+        "Read package-lock.json lines 5926-5931"
+      ],
+      "impact": "An attacker can send crafted multipart requests to any file upload endpoint (e.g. gig images, avatar upload) to cause excessive resource consumption and denial of service.",
+      "suggested_fix": "Upgrade to multer 1.4.4-lts.1 or v2.x when stable.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f07",
+      "title": "mongoose 5.13.23 — end-of-life branch, multiple historical CVEs",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-1104",
+      "location": {
+        "file": "package.json",
+        "line": 33
+      },
+      "description": "The resolved version is mongoose 5.13.23 (package-lock.json line 5809). The mongoose 5.x branch reached end-of-life and is no longer receiving security patches. Notable CVEs affecting the 5.x line include CVE-2022-24298 (prototype pollution via query parsing) and prior prototype pollution vulnerabilities. Mongoose 5.x also predates several security hardening features added in v6 and v7 (BSON injection mitigations, query sanitization improvements). The application uses Mongoose for the catalog/search database (gigs, activity logs).",
+      "evidence": {
+        "code_snippet": "\"node_modules/mongoose\": {\n  \"version\": \"5.13.23\""
+      },
+      "reproduction_steps": [
+        "Read package-lock.json lines 5808-5812",
+        "Verify EOL status at mongoosejs.com/docs/compatibility.html"
+      ],
+      "impact": "Running EOL software means no future security patches. Prototype pollution vectors exist in the 5.x parsing layer that may affect query construction.",
+      "suggested_fix": "Upgrade to mongoose >= 8.x.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f08",
+      "title": "puppeteer 21.11.0 — deprecated with explicit unsupported version notice",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-1104",
+      "location": {
+        "file": "package.json",
+        "line": 38
+      },
+      "description": "The resolved version is puppeteer 21.11.0 (package-lock.json line 6771). The npm registry marks this version as deprecated: '< 24.15.0 is no longer supported'. Additionally, this version has `hasInstallScript: true`, meaning it runs a postinstall script to download Chromium binaries at install time — this is a supply-chain risk vector as the download URL is controlled by the package. The Dockerfile overrides the Chromium binary path with the system chromium, but the CI workflow still downloads the puppeteer-bundled binary.",
+      "evidence": {
+        "code_snippet": "\"node_modules/puppeteer\": {\n  \"version\": \"21.11.0\",\n  \"deprecated\": \"< 24.15.0 is no longer supported\",\n  \"hasInstallScript\": true"
+      },
+      "reproduction_steps": [
+        "Read package-lock.json lines 6769-6774"
+      ],
+      "impact": "Unsupported Puppeteer version running an old Chromium may contain unpatched browser vulnerabilities exploitable via the PDF-generation feature. The postinstall download is a supply-chain risk.",
+      "suggested_fix": "Upgrade to puppeteer >= 24.15.0. In Docker, continue using system Chromium via PUPPETEER_EXECUTABLE_PATH to avoid the binary download.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f09",
+      "title": "CDN-loaded lodash without Subresource Integrity (SRI) — client/index.html",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "client/index.html",
+        "line": 14
+      },
+      "description": "The frontend HTML loads lodash 4.17.21 directly from cdnjs.cloudflare.com using a `<script>` tag with no `integrity=` attribute and no `crossorigin` attribute. If cdnjs.cloudflare.com is compromised, serves a poisoned version, or an attacker achieves CDN cache poisoning or BGP hijack, the malicious script will execute in every user's browser with full application context — including access to session cookies (if HttpOnly is not set), form data, and the application's DOM. There is no Content-Security-Policy either (per recon), so there is no secondary mitigation.",
+      "evidence": {
+        "code_snippet": "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js\"></script>"
+      },
+      "reproduction_steps": [
+        "Read client/index.html line 14",
+        "Observe absence of integrity= and crossorigin= attributes",
+        "Confirm no CSP header from recon notes"
+      ],
+      "impact": "Complete compromise of every user's browser session if CDN is poisoned. Combined with no CSP, there is no defense-in-depth. Note: lodash is already bundled as a server-side dependency (package.json line 26) — loading it again from CDN on the frontend is redundant as well as risky.",
+      "suggested_fix": "Either: (a) remove the CDN script tag entirely and import lodash via the Vite bundler (it is already a declared dependency), or (b) add `integrity=\"sha384-<base64-hash>\" crossorigin=\"anonymous\"` to the script tag.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f10",
+      "title": "Docker base image uses floating tag node:20-alpine — not pinned to digest",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "Dockerfile",
+        "line": 1
+      },
+      "description": "The Dockerfile uses `FROM node:20-alpine` which is a mutable tag. The Docker Hub tag can be updated at any time to a different image digest. Builds are therefore not reproducible and could silently pull a different base OS or Node.js patch version, including one with vulnerabilities or supply-chain tampering.",
+      "evidence": {
+        "code_snippet": "FROM node:20-alpine"
+      },
+      "reproduction_steps": [
+        "Read Dockerfile line 1"
+      ],
+      "impact": "Non-reproducible builds. A compromised or updated tag silently changes the execution environment for all new container builds without any audit trail.",
+      "suggested_fix": "Pin to a specific digest: `FROM node:20-alpine@sha256:<current-digest>`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f11",
+      "title": "docker-compose.yml uses floating tags for all service images",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "docker-compose.yml",
+        "line": 31
+      },
+      "description": "All supporting service images in docker-compose.yml use floating or partially-pinned tags: `postgres:15-alpine` (line 31), `mongo:7` (line 45), `redis:7-alpine` (line 54), `minio/minio` (no tag at all, line 65), `minio/mc` (no tag, line 76), `mailhog/mailhog` (no tag, line 90), `nginx:alpine` (no tag, line 97). The minio/minio, minio/mc, mailhog/mailhog, and nginx:alpine images have no version at all, defaulting to `:latest`. This means `docker compose pull` can silently change the infrastructure.",
+      "evidence": {
+        "code_snippet": "image: postgres:15-alpine\n...\nimage: mongo:7\n...\nimage: redis:7-alpine\n...\nimage: minio/minio\n...\nimage: minio/mc\n...\nimage: mailhog/mailhog\n...\nimage: nginx:alpine"
+      },
+      "reproduction_steps": [
+        "Read docker-compose.yml lines 31, 45, 54, 65, 76, 90, 97"
+      ],
+      "impact": "Unpredictable infrastructure versions. A `docker compose pull` after a tag update could introduce a broken or vulnerable service version into the development/staging environment.",
+      "suggested_fix": "Pin all images to specific digest SHAs or at minimum full version tags (e.g. `nginx:1.27.0-alpine`, `minio/minio:RELEASE.2024-01-01T00-00-00Z`).",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f12",
+      "title": "All package.json dependencies use ^ (caret) ranges — no pinned versions",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "package.json",
+        "line": 15
+      },
+      "description": "Every dependency in both `dependencies` and `devDependencies` in package.json uses the caret range operator (^), meaning `npm install` (which is what CI and Docker use — see a03-f01 and a03-f02) will install the latest semver-compatible version rather than the exact version in the lockfile. While the lockfile pins exact versions, this matters only when `npm ci` is used. Since `npm install` is used throughout, the caret ranges are the effective version specification. Notable examples: `jsonwebtoken: ^8.5.1` (resolved to 8.5.1 — still in the vulnerable range), `multer: ^1.4.3` (resolved to 1.4.4 — still deprecated/vulnerable), `mongoose: ^5.13.0` (resolved to 5.13.23 — EOL range).",
+      "evidence": {
+        "code_snippet": "\"jsonwebtoken\": \"^8.5.1\",\n\"mongoose\": \"^5.13.0\",\n\"multer\": \"^1.4.3\""
+      },
+      "reproduction_steps": [
+        "Read package.json lines 15-49 — every entry uses ^ prefix"
+      ],
+      "impact": "Combined with `npm install` in CI/Docker, a new malicious or breaking semver-compatible release of any dependency would be silently adopted. The lockfile provides false assurance while `npm install` is in use.",
+      "suggested_fix": "Switch CI and Docker to `npm ci`, and consider pinning critical security-sensitive packages (jsonwebtoken, multer, mongoose) to exact versions without the caret.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f13",
+      "title": "serve-index 1.9.2 — known-vulnerable version (CVE-2024-28176 / path traversal via directory listing)",
+      "severity": "medium",
+      "confidence": "suspected",
+      "category": "A03",
+      "cwe": "CWE-22",
+      "location": {
+        "file": "package.json",
+        "line": 39
+      },
+      "description": "serve-index 1.9.2 (package-lock.json line 7168-7172) is the only version ever published for this package; it has not received updates since 2016. It is a direct runtime dependency used to expose directory listings at the `/uploads` mount point (confirmed by recon notes). The package uses an old version of debug (2.6.9) with known issues and has not had any security reviews. Multiple issues have been filed against this package regarding path traversal and information disclosure in directory listing — the package is effectively abandoned. Given the combination of an abandoned package serving directory listings of the uploads folder (which may contain user-uploaded files with sensitive names), this is a meaningful risk even if no single pinned CVE is available.",
+      "evidence": {
+        "code_snippet": "\"node_modules/serve-index\": {\n  \"version\": \"1.9.2\""
+      },
+      "reproduction_steps": [
+        "Read package-lock.json lines 7168-7183",
+        "Read recon notes confirming serve-index mounted at /uploads"
+      ],
+      "impact": "Directory listings of user uploads are publicly exposed. Combined with an abandoned, unpatched package, this is an ongoing information disclosure risk.",
+      "suggested_fix": "Remove serve-index entirely. If directory browsing of uploads is needed for development, gate it behind an admin authentication middleware.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f14",
+      "title": "Real-looking credentials in .env.example committed to repository",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-312",
+      "location": {
+        "file": ".env.example",
+        "line": 8
+      },
+      "description": "The .env.example file contains several values that appear to be real or production-style credentials rather than obvious placeholders: `PG_PASSWORD=Hf$ecure_Pr0d_2024!` (line 8, looks like a real production password), `SESSION_SECRET=a7f3b9c1d8e24f5690ab3c7de81f2439` (line 19, a 32-char hex string that looks like a real secret), `JWT_SECRET=hf-prod-jwt-K8sD3ployM3nt-v2` (line 22, labeled 'prod' and 'K8sDeployMent'), and `MINIO_ACCESS_KEY=AKIAIOSFODNN7HIREFLOW` / `MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYHIREFLOWKEY` (lines 28-29, which are the AWS documentation example keys in a recognizable format). If developers copy this file to .env and use these values, or if these are actual production values committed as 'examples', credentials are exposed in git history.",
+      "evidence": {
+        "code_snippet": "PG_PASSWORD=Hf$ecure_Pr0d_2024!\nSESSION_SECRET=a7f3b9c1d8e24f5690ab3c7de81f2439\nJWT_SECRET=hf-prod-jwt-K8sD3ployM3nt-v2\nMINIO_ACCESS_KEY=AKIAIOSFODNN7HIREFLOW\nMINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYHIREFLOWKEY"
+      },
+      "reproduction_steps": [
+        "Read .env.example lines 8, 19, 22, 28, 29"
+      ],
+      "impact": "If any of these values are in use in staging/production, they are permanently exposed in git history. The JWT secret labeled 'prod' is particularly concerning as it would allow arbitrary JWT forgery.",
+      "suggested_fix": "Replace all .env.example values with clearly fake placeholders (e.g. `PG_PASSWORD=change_me`, `JWT_SECRET=<your-secret-here>`). Rotate any secrets that may have been copied from this file into actual deployments.",
+      "needs_poc": false
+    },
+    {
+      "id": "a03-f15",
+      "title": "No automated dependency management configured (no Dependabot or Renovate)",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A03",
+      "cwe": "CWE-1104",
+      "location": {
+        "file": ".github/",
+        "line": 1
+      },
+      "description": "There is no `.github/dependabot.yml` and no `renovate.json` in the repository. The only security-related CI automation is a single `npm audit` step that is suppressed with `continue-on-error: true` (see a03-f03). With multiple EOL and CVE-affected packages already in the dependency tree (jsonwebtoken 8.5.1, multer 1.4.4, mongoose 5.13.23, puppeteer 21.11.0) and no automated alerting configured, vulnerable dependencies will persist indefinitely.",
+      "evidence": {
+        "code_snippet": "# .github/ directory contains only workflows/ci.yml — no dependabot.yml or renovate.json"
+      },
+      "reproduction_steps": [
+        "List .github/ directory — only ci.yml present",
+        "Search repository root for renovate.json — not found"
+      ],
+      "impact": "Vulnerable dependencies accumulate without automated detection or pull request generation. Combined with the suppressed audit step, there is no active mechanism to surface new CVEs.",
+      "suggested_fix": "Add `.github/dependabot.yml` with weekly npm ecosystem updates and a security-only update policy for production dependencies.",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Reviewed all supply chain artifacts: .github/workflows/ci.yml (the only workflow file), package.json, package-lock.json (full), client/package-lock.json (partial — client has no separate package.json file, only a lockfile embedding the manifest), Dockerfile, docker-compose.yml, client/index.html, .env.example, .gitignore. Checked for postinstall/preinstall/prepare scripts (none in package.json scripts block). Checked for .npmrc and .yarnrc (absent). Checked for renovate.json and dependabot.yml (absent). Extracted resolved versions for all flagged packages from package-lock.json and cross-referenced against known CVE databases. No GitHub Actions workflows other than ci.yml found — no pull_request_target trigger present (positive finding, not a risk).",
+  "blind_spots": [
+    "Could not run `npm audit` or `npm audit --json` to get the full advisory list — cross-referenced known CVEs manually against resolved versions.",
+    "client/package.json does not exist as a standalone file; client dependency manifest is embedded only in client/package-lock.json. Client lockfile reviewed for deprecated packages — none found. Vite 5.4.21 is current.",
+    "Did not check transitive dependencies exhaustively — focused on direct dependencies and any transitive packages flagged as deprecated in the lockfile.",
+    "OSV/GitHub Advisory database may have additional CVEs for mongoose 5.x or express 4.22.1 not covered here."
+  ]
+}

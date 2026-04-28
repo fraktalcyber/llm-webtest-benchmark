@@ -1,0 +1,477 @@
+{
+  "agent": "a02-security-misconfiguration",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a02-f01",
+      "title": "Content-Security-Policy header completely absent — helmet CSP explicitly disabled",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-1021",
+      "location": {
+        "file": "src/index.js",
+        "line": 50
+      },
+      "description": "helmet is invoked with `contentSecurityPolicy: false`, which removes the only mechanism preventing cross-site scripting payload execution. No CSP is present on any response, including the React SPA entry point and all API responses. There is no CSP meta tag in the HTML either. Without CSP, any XSS vector (e.g. the lodash CDN injection surface, reflected errors, stored XSS in gig/project content) executes without any browser-enforced restriction.",
+      "evidence": {
+        "code_snippet": "app.use(helmet({\n  contentSecurityPolicy: false,\n  crossOriginEmbedderPolicy: false\n}));",
+        "response_snippet": "curl -sI http://localhost:3000/ | grep -i content-security\n(no output — header absent)"
+      },
+      "reproduction_steps": [
+        "curl -sI http://localhost:3000/ | sort",
+        "Observe no Content-Security-Policy header in response"
+      ],
+      "impact": "Any stored or reflected XSS in the application runs without restriction. An attacker can exfiltrate session cookies, forge requests, or pivot to other origins. Amplifies every XSS finding in A03/A07.",
+      "suggested_fix": "Remove `contentSecurityPolicy: false` from the helmet call and configure a policy: at minimum `default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none';`. Also remove the external lodash CDN tag (see a02-f09) or add an `integrity=` SRI attribute.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f02",
+      "title": "CORS configured to reflect any origin with credentials — wildcard origin + credentials",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-942",
+      "location": {
+        "file": "src/index.js",
+        "line": 46
+      },
+      "description": "The CORS middleware is configured with `origin: process.env.CORS_ORIGIN || true` and `credentials: true`. When `CORS_ORIGIN` is not set (as in the running instance — the container has no CORS_ORIGIN env var), `origin: true` causes Express/cors to reflect whatever `Origin` header the client sends. Combined with `credentials: true`, this satisfies the browser's cross-origin credentialed request requirements. Any origin can make credentialed cross-site requests to the API and receive `Access-Control-Allow-Origin: <attacker-origin>` + `Access-Control-Allow-Credentials: true` in the response.",
+      "evidence": {
+        "code_snippet": "app.use(cors({\n  origin: process.env.CORS_ORIGIN || true,\n  credentials: true\n}));",
+        "response_snippet": "curl -sI -H 'Origin: https://evil.com' http://localhost:3000/api/auth/me\nAccess-Control-Allow-Origin: https://evil.com\nAccess-Control-Allow-Credentials: true"
+      },
+      "reproduction_steps": [
+        "curl -sI -H 'Origin: https://evil.com' http://localhost:3000/api/auth/me",
+        "Observe Access-Control-Allow-Origin: https://evil.com and Access-Control-Allow-Credentials: true",
+        "Also confirmed on POST: curl -si -X POST http://localhost:3000/api/auth/login -H 'Origin: https://attacker.evil' ... returns same headers with Set-Cookie"
+      ],
+      "impact": "An attacker-controlled page on any domain can make credentialed requests to the HireFlow API (including authenticated endpoints), read the full response body, and harvest session data or perform CSRF-equivalent actions. Achieves cross-origin account takeover when combined with any interaction.",
+      "suggested_fix": "Set CORS_ORIGIN to an explicit allowlist (e.g. `https://hireflow.com,https://www.hireflow.com`). Replace `origin: true` with an allowlist function. Never combine an open/reflected origin with `credentials: true`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f03",
+      "title": "Unauthenticated /api/debug/info endpoint exposes internal infrastructure details",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-200",
+      "location": {
+        "file": "src/index.js",
+        "line": 101
+      },
+      "description": "A diagnostic endpoint `GET /api/debug/info` is registered with no authentication middleware. It returns: Node.js version, environment name, process uptime, full memory stats (rss, heapTotal, heapUsed, external), OS platform, PID, PostgreSQL hostname, Redis hostname, and the full MongoDB URI. This is accessible by any unauthenticated request.",
+      "evidence": {
+        "code_snippet": "app.get('/api/debug/info', (req, res) => {\n  res.json({\n    node_version: process.version,\n    environment: config.env,\n    uptime: process.uptime(),\n    memory: process.memoryUsage(),\n    platform: process.platform,\n    pid: process.pid,\n    db_host: config.pg.host,\n    redis_host: config.redis.host,\n    mongo_uri: config.mongo.uri\n  });\n});",
+        "response_snippet": "curl -s http://localhost:3000/api/debug/info\n{\"node_version\":\"v20.20.2\",\"environment\":\"development\",\"uptime\":458.5,\"memory\":{\"rss\":117141504,\"heapTotal\":53288960,\"heapUsed\":47890432,\"external\":22006175,\"arrayBuffers\":18530204},\"platform\":\"linux\",\"pid\":3061,\"db_host\":\"postgres\",\"redis_host\":\"redis\",\"mongo_uri\":\"mongodb://mongodb:27017/hireflow\"}"
+      },
+      "reproduction_steps": [
+        "curl -s http://localhost:3000/api/debug/info",
+        "No authentication header required",
+        "Response discloses full MongoDB URI, database hostnames, PID, and memory layout"
+      ],
+      "impact": "Leaks internal service topology to unauthenticated attackers. MongoDB URI and hostnames allow targeted attacks. PID and memory stats assist exploitation of memory-safety issues. Node version fingerprints the runtime for known CVEs.",
+      "suggested_fix": "Remove the endpoint from production builds, or at minimum protect it with `requireAdmin` middleware. Evaluate whether ops tooling can use an internal-only channel (e.g. sidecar health endpoint not reachable from the internet).",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f04",
+      "title": "Directory listing enabled on /uploads/ via serve-index — all uploaded files enumerable",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-548",
+      "location": {
+        "file": "src/index.js",
+        "line": 77
+      },
+      "description": "The `serve-index` package is mounted at `/uploads` without any authentication or `index: false` option. Any visitor can browse the full listing of uploaded files including user-uploaded HTML, SVG, text files, and media. The listing includes 17+ files currently. serve-index renders a styled HTML directory listing with clickable file links.",
+      "evidence": {
+        "code_snippet": "app.use('/uploads', serveIndex(path.join(__dirname, '../uploads'), { icons: true }));",
+        "response_snippet": "curl -s http://localhost:3000/uploads/ | head -5\n<!DOCTYPE html><html><head><title>listing directory /uploads/</title>...\n\nListed files include:\n/uploads/0716b0fb-35d3-4de4-a4dd-5af64ea68f60.html\n/uploads/3c29debc-2ec6-4af6-a61a-72bdb7a207f7.html\n/uploads/81d4beeb-b1a4-4505-bbd7-c211944ee6a0.txt\n/uploads/92d7312d-31da-4692-b5d8-88451778575f.xml\n(and 13 more)"
+      },
+      "reproduction_steps": [
+        "curl -s http://localhost:3000/uploads/",
+        "Observe full HTML directory index with all uploaded files listed",
+        "curl -s http://localhost:3000/uploads/81d4beeb-b1a4-4505-bbd7-c211944ee6a0.txt"
+      ],
+      "impact": "Attackers can enumerate all uploaded files, including potentially sensitive documents, source files, or files whose UUIDs were assumed to be unguessable. HTML and SVG files served from the same origin can execute JavaScript, bypassing CSP (which is absent — see a02-f01).",
+      "suggested_fix": "Remove the serve-index mount entirely. If directory browsing is genuinely needed internally, add authentication middleware. For static file serving, keep only `express.static` with no directory listing.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f05",
+      "title": "Stack traces and internal file paths exposed in all error responses due to case-sensitive NODE_ENV check",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-209",
+      "location": {
+        "file": "src/middleware/errorHandler.js",
+        "line": 35
+      },
+      "description": "The global error handler includes a stack trace in the response body when `process.env.NODE_ENV !== 'Production'` (capital P). Node.js convention is lowercase `'production'`. Since the env var is set to `'development'` (or any value other than the capital-P `'Production'`), the condition is always true in practice — including when NODE_ENV is `production`. The stack trace includes full internal file paths, Mongoose model names, library version internals, and controller function names.",
+      "evidence": {
+        "code_snippet": "// src/middleware/errorHandler.js:35\nif (process.env.NODE_ENV !== 'Production') {\n  response.stack = err.stack;\n}",
+        "response_snippet": "curl -s http://localhost:3000/api/gigs/not-a-valid-id\n{\"error\":\"Cast to ObjectId failed for value \\\"not-a-valid-id\\\" (type string) at path \\\"_id\\\" for model \\\"Gig\\\"\",\"stack\":\"CastError: Cast to ObjectId failed...\\n    at SchemaObjectId.cast (/app/node_modules/mongoose/lib/schema/objectId.js:253:11)\\n    at SchemaType.applySetters (/app/node_modules/mongoose/lib/schemaType.js:1288:12)\\n    ...\\n    at async exports.getGig (/app/src/gigs/gigs.controller.js:19:17)\"}"
+      },
+      "reproduction_steps": [
+        "curl -s http://localhost:3000/api/gigs/not-a-valid-id",
+        "Observe 'stack' field in JSON response containing full internal paths and library versions",
+        "Also triggered by: curl -X POST http://localhost:3000/api/auth/login -d '{invalid json' -H 'Content-Type: application/json'"
+      ],
+      "impact": "Discloses internal application structure (/app/src/gigs/gigs.controller.js), library versions with exact line numbers (mongoose/lib/schema/objectId.js:253), and model names. Enables targeted exploitation by confirming code paths and library versions. This bug means stack traces will also leak when NODE_ENV=production in a future deployment.",
+      "suggested_fix": "Fix the comparison to lowercase: `if (process.env.NODE_ENV !== 'production')`. Additionally, consider never sending stack traces to clients regardless of environment — log them server-side only.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f06",
+      "title": "Weak hardcoded JWT secret — guessable default value in running production-like instance",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-321",
+      "location": {
+        "file": "src/config/index.js",
+        "line": 31
+      },
+      "description": "The running container has `JWT_SECRET=hireflow-jwt-secret-2024` set via docker-compose environment. This short, predictable, domain-prefixed secret can be brute-forced offline with tools like hashcat against any intercepted JWT. The fallback in src/config/index.js is `'hireflow2024api'` (11 characters). Both values are weak. Confirmed exploitation: a superadmin JWT was successfully forged using the running secret.",
+      "evidence": {
+        "code_snippet": "// src/config/index.js:31\njwt: {\n  secret: process.env.JWT_SECRET || 'hireflow2024api',\n  expiresIn: process.env.JWT_EXPIRES_IN || '7d'\n}",
+        "response_snippet": "# Forged superadmin JWT accepted by /api/auth/me:\ncurl -s http://localhost:3000/api/auth/me -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImY3MGM0OTFlLThjMWUtNGViZC1hNTk4LTQ4ZGNjYjE1ZGE4OSIsImVtYWlsIjoiYWxpY2UuYWRtaW5AaGlyZWZsb3cuY29tIiwicm9sZSI6InN1cGVyYWRtaW4iLCJpYXQiOjE3NzYxNzg5ODYsImV4cCI6OTk5OTk5OTk5OX0.KVdLOjk9qokO1Q_vYD-e5GLv1Wym-2DNoHzfESnBhAQ'\n{\"user\":{\"id\":\"f70c491e-8c1e-4ebd-a598-48dccb15da89\",\"email\":\"alice.admin@hireflow.com\",\"role\":\"superadmin\",...}}"
+      },
+      "reproduction_steps": [
+        "docker exec webvulnbench-app-1 env | grep JWT_SECRET  → JWT_SECRET=hireflow-jwt-secret-2024",
+        "Forge a JWT with HS256, the secret 'hireflow-jwt-secret-2024', and any user payload",
+        "curl -s http://localhost:3000/api/auth/me -H 'Authorization: Bearer <forged_token>'",
+        "Observe successful authentication as the target user/role"
+      ],
+      "impact": "Complete authentication bypass. An attacker who can guess or brute-force the JWT secret can forge tokens for any user including superadmin, giving full platform access. The forged token above authenticated as alice.admin@hireflow.com with role superadmin.",
+      "suggested_fix": "Generate a cryptographically random secret of at least 256 bits (e.g. `openssl rand -hex 32`) and inject it as JWT_SECRET via a secrets manager. Remove the hardcoded fallback from config/index.js — fail startup if JWT_SECRET is not set.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f07",
+      "title": "Hardcoded default session secret — cookie signing key exposed in source code",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-321",
+      "location": {
+        "file": "src/config/index.js",
+        "line": 25
+      },
+      "description": "The session middleware is configured with `secret: config.session.secret`, where the config fallback is the string `'hireflow-session-key-change-in-production'`. The running container confirms `SESSION_SECRET=hireflow-session-key-change-in-production` — exactly the default from source code, never changed. This secret is used to sign `connect.sid` session cookies. Knowing the secret allows an attacker to forge session cookies and hijack any session.",
+      "evidence": {
+        "code_snippet": "// src/config/index.js:25\nsession: {\n  secret: process.env.SESSION_SECRET || 'hireflow-session-key-change-in-production'\n}",
+        "response_snippet": "docker exec webvulnbench-app-1 env | grep SESSION\nSESSION_SECRET=hireflow-session-key-change-in-production\n\n# Cookie issued:\nSet-Cookie: connect.sid=s%3A...; Path=/; HttpOnly"
+      },
+      "reproduction_steps": [
+        "docker exec webvulnbench-app-1 env | grep SESSION_SECRET",
+        "Confirm value matches source fallback: 'hireflow-session-key-change-in-production'",
+        "Use express-session cookie-signature library with this secret to forge a connect.sid value"
+      ],
+      "impact": "Attacker can forge session cookies for any session ID observed in transit or guessed. Enables session hijacking without needing credentials.",
+      "suggested_fix": "Generate a random 256-bit value for SESSION_SECRET and never fall back to a hardcoded string. Fail startup if SESSION_SECRET env var is not set.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f08",
+      "title": "Session cookie missing Secure and SameSite attributes",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-614",
+      "location": {
+        "file": "src/index.js",
+        "line": 67
+      },
+      "description": "The session cookie is issued with `HttpOnly` but without `Secure` or `SameSite` flags. The `secure` flag is gated on `config.env === 'production'` but the running environment is `'development'`. There is no SameSite attribute at all in the session configuration. Without `Secure`, the cookie is sent over plain HTTP. Without `SameSite`, cross-site requests (CSRF) can include the session cookie.",
+      "evidence": {
+        "code_snippet": "cookie: {\n  secure: config.env === 'production',  // false in dev\n  httpOnly: true\n  // no sameSite\n}",
+        "response_snippet": "Set-Cookie: connect.sid=s%3A...; Path=/; HttpOnly\n(Secure and SameSite are both absent)"
+      },
+      "reproduction_steps": [
+        "curl -si -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"bob.admin@hireflow.com\",\"password\":\"password123\"}'",
+        "Observe Set-Cookie header: Path=/; HttpOnly — no Secure, no SameSite"
+      ],
+      "impact": "Session cookie transmitted over HTTP is exposed to network sniffing. Absence of SameSite makes the application vulnerable to CSRF attacks on state-changing endpoints. Combined with the reflected CORS (a02-f02), cross-site attacks are amplified.",
+      "suggested_fix": "Add `sameSite: 'lax'` (or `'strict'`) to the session cookie config. Set `secure: true` unconditionally when behind HTTPS or when proxied (use `trust proxy`). Do not condition `secure` on NODE_ENV since that flag should be safe in all environments.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f09",
+      "title": "External CDN script (Lodash) loaded without Subresource Integrity (SRI)",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-353",
+      "location": {
+        "file": "client/index.html",
+        "line": 14
+      },
+      "description": "The application HTML includes a `<script>` tag loading lodash 4.17.21 from `https://cdnjs.cloudflare.com` without an `integrity=` attribute. If the CDN is compromised, or if an attacker can perform a MITM on the CDN delivery (unlikely over HTTPS but relevant in downgrade scenarios), they can serve a modified lodash that runs arbitrary JavaScript in all users' browsers. No CSP is present to restrict script sources (see a02-f01), meaning any script injected via this vector executes freely.",
+      "evidence": {
+        "code_snippet": "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js\"></script>",
+        "response_snippet": "curl -s http://localhost:3000/ | grep cdnjs\n<script src=\"https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js\"></script>"
+      },
+      "reproduction_steps": [
+        "curl -s http://localhost:3000/ | grep cdnjs",
+        "Observe script tag with no integrity= attribute"
+      ],
+      "impact": "If the CDN origin or content is tampered with, full XSS in all authenticated sessions. There is also no fallback if the CDN is unreachable, which is a reliability issue.",
+      "suggested_fix": "Either bundle lodash as a local dependency (`npm install lodash` and import in the React bundle) or add the correct `integrity=` SRI hash to the script tag. Also add `crossorigin='anonymous'`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f10",
+      "title": "MinIO object storage console exposed on :9001 with default credentials",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-1392",
+      "location": {
+        "file": "docker-compose.yml",
+        "line": 69
+      },
+      "description": "The MinIO S3-compatible storage console is bound to host port 9001 with `MINIO_ROOT_USER=hireflow` and `MINIO_ROOT_PASSWORD=hireflow123`. These are the same defaults configured in `src/config/index.js`. Login to the MinIO console with these credentials is confirmed. After login, full admin API access is available including bucket management, object listing, and policy modification.",
+      "evidence": {
+        "code_snippet": "minio:\n  environment:\n    MINIO_ROOT_USER: hireflow\n    MINIO_ROOT_PASSWORD: hireflow123",
+        "response_snippet": "curl -X POST http://localhost:9001/api/v1/login -H 'Content-Type: application/json' -d '{\"accessKey\":\"hireflow\",\"secretKey\":\"hireflow123\"}'\nHTTP: 204\n\ncurl -b /tmp/minio_cookies.txt http://localhost:9001/api/v1/buckets\n{\"buckets\":[{\"name\":\"hireflow-uploads\",\"rw_access\":{\"read\":true,\"write\":true}}],\"total\":1}"
+      },
+      "reproduction_steps": [
+        "curl -s -c /tmp/mc.txt -X POST http://localhost:9001/api/v1/login -H 'Content-Type: application/json' -d '{\"accessKey\":\"hireflow\",\"secretKey\":\"hireflow123\"}' -w '%{http_code}'",
+        "Observe HTTP 204 (success)",
+        "curl -s -b /tmp/mc.txt http://localhost:9001/api/v1/buckets",
+        "Observe full bucket admin access"
+      ],
+      "impact": "Full read/write access to all stored files (user avatars, gig images, uploaded documents). Attacker can delete all stored files, replace files with malicious content, exfiltrate all uploads, or change bucket policies to make private data public.",
+      "suggested_fix": "Use a strong randomly-generated MinIO access key and secret key. Do not expose the MinIO console port (9001) to the host network in production — remove the `9000:9000` and `9001:9001` port bindings and access via internal Docker network only.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f11",
+      "title": "Redis exposed on host port 6379 with no authentication",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-306",
+      "location": {
+        "file": "docker-compose.yml",
+        "line": 55
+      },
+      "description": "Redis 7 is bound to host port 6379 with no password configured (`requirepass` not set). Any process on the host or any network-reachable host can connect and issue arbitrary Redis commands. Redis stores session data (connect-redis store) — an attacker can enumerate all sessions, read session contents, inject session data, or delete sessions to force logout of all users.",
+      "evidence": {
+        "code_snippet": "redis:\n  image: redis:7-alpine\n  ports:\n    - \"6379:6379\"\n  # no requirepass, no auth configuration",
+        "response_snippet": "echo -e '*1\\r\\n$4\\r\\nPING\\r\\n' | nc -w 2 localhost 6379\n+PONG\n\n(No authentication required)"
+      },
+      "reproduction_steps": [
+        "echo -e '*1\\r\\n$4\\r\\nPING\\r\\n' | nc -w 2 localhost 6379",
+        "Observe +PONG — connection accepted without credentials",
+        "echo -e '*1\\r\\n$4\\r\\nKEYS\\r\\n$1\\r\\n*\\r\\n' | nc -w 2 localhost 6379",
+        "Observe all session keys listed"
+      ],
+      "impact": "Full access to session store — read all active sessions to hijack authenticated users. Can also SET arbitrary keys to forge sessions. Redis is often used for rate-limit counters (can be reset), cache poisoning, and in some configurations as a persistence mechanism.",
+      "suggested_fix": "Set a strong `requirepass` in the Redis configuration. Remove the `6379:6379` host port binding so Redis is only accessible on the internal Docker network. Use Redis ACLs in production.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f12",
+      "title": "MongoDB exposed on host port 27017 with no authentication",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-306",
+      "location": {
+        "file": "docker-compose.yml",
+        "line": 46
+      },
+      "description": "MongoDB 7 is bound to host port 27017 without any authentication configured (no `MONGO_INITDB_ROOT_USERNAME`/`MONGO_INITDB_ROOT_PASSWORD` in docker-compose, no `--auth` flag). The port is confirmed open and accepting TCP connections. The `hireflow` database contains gig catalog data and activity logs.",
+      "evidence": {
+        "code_snippet": "mongodb:\n  image: mongo:7\n  ports:\n    - \"27017:27017\"\n  environment:\n    MONGO_INITDB_DATABASE: hireflow\n  # no MONGO_INITDB_ROOT_USERNAME or MONGO_INITDB_ROOT_PASSWORD",
+        "response_snippet": "python3 -c \"import socket; s=socket.socket(); s.settimeout(3); s.connect(('localhost',27017)); print('OPEN'); s.close()\"\nOPEN\n\n(No auth credentials in docker-compose environment)"
+      },
+      "reproduction_steps": [
+        "python3 -c \"import socket; s=socket.socket(); s.connect(('localhost',27017)); print('OPEN')\"",
+        "mongosh --host localhost --port 27017 --eval 'db.adminCommand(\"listDatabases\")' --quiet",
+        "Observe database listing without any authentication"
+      ],
+      "impact": "Full unauthenticated read/write access to the MongoDB instance. Gig data, activity logs, and any other Mongoose-managed collections are fully exposed. Attacker can read, modify, or delete all gig listings and activity records.",
+      "suggested_fix": "Enable MongoDB authentication by setting `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD` in docker-compose and creating a database user. Remove `27017:27017` host port binding — MongoDB should only be accessible on the internal Docker network.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f13",
+      "title": "MailHog email capture UI exposed on :8025 with no authentication — captures all application email",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-306",
+      "location": {
+        "file": "docker-compose.yml",
+        "line": 91
+      },
+      "description": "MailHog (a dev email capture tool) is bound to host port 8025 with no authentication. The application sends all transactional email (password resets, email verification, account notifications) to the MailHog SMTP on port 1025. An unauthenticated attacker can access the MailHog web API at :8025 and read all 95 captured emails, including password reset links and email verification tokens.",
+      "evidence": {
+        "code_snippet": "mailhog:\n  image: mailhog/mailhog\n  ports:\n    - \"1025:1025\"\n    - \"8025:8025\"",
+        "response_snippet": "curl -s http://localhost:8025/api/v2/messages | python3 -c \"import json,sys; d=json.load(sys.stdin); print('Total emails:', d['total'])\"\nTotal emails: 95\n\nSample email includes:\n{\"Subject\":[\"Verify your HireFlow account\"],\"Body\":\"...http://localhost:3000/api/auth/verify-email/3e80cdd15d8c9e7f6cda371917f6e7410c4542276db9cb11c67be4c6f67aee24...\"}"
+      },
+      "reproduction_steps": [
+        "curl -s http://localhost:8025/api/v2/messages",
+        "Observe all application emails including password reset tokens and verification links",
+        "No authentication header required"
+      ],
+      "impact": "Complete account takeover for any user who has requested a password reset or email verification — attacker can read the reset token from MailHog and use it before the legitimate user. 95 emails currently captured including at least one verification email with a full token.",
+      "suggested_fix": "MailHog is a development-only tool and should never be deployed in staging or production. Remove it from docker-compose for non-local environments. If required locally, do not expose port 8025 externally. In any environment that sends real email, use a proper SMTP relay.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f14",
+      "title": ".env.example committed to git with production-realistic credential values",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-540",
+      "location": {
+        "file": ".env.example",
+        "line": 1
+      },
+      "description": ".env.example is tracked in git (confirmed via `git ls-files .env.example`) and contains values that appear to be real credentials rather than placeholder descriptions. Specifically: `PG_PASSWORD=Hf$ecure_Pr0d_2024!`, `JWT_SECRET=hf-prod-jwt-K8sD3ployM3nt-v2`, `SESSION_SECRET=a7f3b9c1d8e24f5690ab3c7de81f2439`, `MINIO_ACCESS_KEY=AKIAIOSFODNN7HIREFLOW`, `MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYHIREFLOWKEY`. These look like production credentials stored in a file committed to the repository.",
+      "evidence": {
+        "code_snippet": "# .env.example (committed to git)\nPG_PASSWORD=Hf$ecure_Pr0d_2024!\nJWT_SECRET=hf-prod-jwt-K8sD3ployM3nt-v2\nSESSION_SECRET=a7f3b9c1d8e24f5690ab3c7de81f2439\nMINIO_ACCESS_KEY=AKIAIOSFODNN7HIREFLOW\nMINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYHIREFLOWKEY",
+        "response_snippet": "cd /tmp/webvulnbench && git ls-files .env.example\n.env.example\n\ngit log --oneline -- .env.example\n37095a0 Add user settings, link previews...\n949f5ba Initial commit: HireFlow..."
+      },
+      "reproduction_steps": [
+        "git ls-files .env.example  # confirms it is tracked",
+        "cat .env.example  # reveals credential-looking values",
+        "git log --oneline -- .env.example  # shows it has been in git since initial commit"
+      ],
+      "impact": "Anyone with read access to the git repository (including CI systems, forks, or if the repo is public) can obtain these credentials. If these match any production environment, immediate credential rotation is required.",
+      "suggested_fix": "Replace all values in .env.example with obvious placeholders (e.g. `PG_PASSWORD=CHANGE_ME`, `JWT_SECRET=<generate-with-openssl-rand-hex-32>`). Audit git history with tools like truffleHog or gitleaks to identify any real secrets committed historically.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f15",
+      "title": "authLimiter rate limiter defined but never applied to authentication endpoints",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-307",
+      "location": {
+        "file": "src/auth/auth.routes.js",
+        "line": 1
+      },
+      "description": "The middleware file `src/middleware/rateLimiter.js` exports an `authLimiter` configured at 20 requests per 15 minutes — an appropriate stricter limit for auth endpoints. However, `authLimiter` is never imported or used anywhere in the codebase. Only `apiLimiter` (1000/15min in development, 200/15min in production) is applied globally at `app.use('/api', apiLimiter)`. The login, register, forgot-password, and reset-password endpoints are not rate-limited beyond this generous global limit.",
+      "evidence": {
+        "code_snippet": "// src/middleware/rateLimiter.js — exported but never imported elsewhere:\nconst authLimiter = rateLimit({\n  windowMs: 15 * 60 * 1000,\n  max: 20,\n  ...\n});\nmodule.exports = { apiLimiter, authLimiter, uploadLimiter };\n\n// src/auth/auth.routes.js — no authLimiter import:\nconst { authenticate } = require('../middleware/auth');\n// authLimiter never required here",
+        "response_snippet": "grep -r 'authLimiter' /tmp/webvulnbench/src/\n/tmp/webvulnbench/src/middleware/rateLimiter.js:const authLimiter = ...\n/tmp/webvulnbench/src/middleware/rateLimiter.js:module.exports = { apiLimiter, authLimiter, uploadLimiter };\n(only defined and exported, never imported)"
+      },
+      "reproduction_steps": [
+        "grep -r 'authLimiter' /tmp/webvulnbench/src/",
+        "Observe authLimiter is only defined in rateLimiter.js, never imported anywhere",
+        "Confirm /api/auth/login has no per-route rate limiting beyond 1000/15min"
+      ],
+      "impact": "An attacker can make 1000 login attempts per 15-minute window (development) or 200 (production) against any account without being blocked. This enables online password spraying against known accounts (admin@hireflow.com, alice.admin@hireflow.com, etc.). Note: this straddles A02 (misconfiguration) and A07 (authentication weakness).",
+      "suggested_fix": "Import and apply `authLimiter` on the auth router: add `const { authLimiter } = require('../middleware/rateLimiter');` and mount it on `/login`, `/register`, `/forgot-password`, and `/reset-password` routes.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f16",
+      "title": "X-Powered-By: Express header exposed on CORS preflight (OPTIONS) responses",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-200",
+      "location": {
+        "file": "src/index.js",
+        "line": 50
+      },
+      "description": "Helmet suppresses the `X-Powered-By` header on regular responses, but CORS preflight responses (HTTP OPTIONS) bypass the Helmet middleware and expose `X-Powered-By: Express`. This reveals the framework and version fingerprint to attackers performing reconnaissance.",
+      "evidence": {
+        "code_snippet": "// Helmet applied after cors, but OPTIONS responses from cors middleware\n// bypass the helmet x-powered-by removal\napp.use(cors({...}));\napp.use(helmet({...}));",
+        "response_snippet": "curl -X OPTIONS -sI http://localhost:3000/api/auth/me\nHTTP/1.1 204 No Content\nX-Powered-By: Express\nAccess-Control-Allow-Methods: GET,HEAD,PUT,PATCH,POST,DELETE\n..."
+      },
+      "reproduction_steps": [
+        "curl -X OPTIONS -sI http://localhost:3000/api/auth/me",
+        "Observe X-Powered-By: Express in response headers"
+      ],
+      "impact": "Low — reveals Express framework. Combined with version-specific CVEs, assists targeted exploitation.",
+      "suggested_fix": "Move `app.use(helmet(...))` before `app.use(cors(...))` in middleware ordering, or explicitly call `app.disable('x-powered-by')` before any middleware.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f17",
+      "title": "HSTS max-age is 180 days — below recommended 1 year, and header sent over HTTP where it is ignored",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-523",
+      "location": {
+        "file": "src/index.js",
+        "line": 50
+      },
+      "description": "The Strict-Transport-Security header is set with `max-age=15552000` (180 days). OWASP and HSTS preload requirements specify a minimum of 1 year (31536000 seconds). Additionally, the application runs over plain HTTP (no TLS configured in docker-compose or nginx), so browsers will ignore the HSTS header sent over HTTP per RFC 6797. The `preload` directive is also absent.",
+      "evidence": {
+        "response_snippet": "curl -sI http://localhost:3000/ | grep -i strict-transport\nStrict-Transport-Security: max-age=15552000; includeSubDomains\n\n(no preload directive; sent over HTTP where it is ignored by browsers)"
+      },
+      "reproduction_steps": [
+        "curl -sI http://localhost:3000/ | grep -i strict",
+        "Observe max-age=15552000 (180 days, not the recommended 31536000)",
+        "Note the application is served over HTTP — HSTS header is ineffective here"
+      ],
+      "impact": "Low in isolation. HSTS sent over HTTP is silently ignored. Short max-age means browsers will revert to allowing HTTP connections sooner than necessary.",
+      "suggested_fix": "Configure TLS termination in nginx. Set `max-age=31536000; includeSubDomains; preload`. Only apply HSTS after TLS is correctly configured.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f18",
+      "title": "CrossOriginEmbedderPolicy disabled in Helmet — missing isolation header",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-693",
+      "location": {
+        "file": "src/index.js",
+        "line": 52
+      },
+      "description": "Helmet is invoked with `crossOriginEmbedderPolicy: false`, disabling the `Cross-Origin-Embedder-Policy: require-corp` header. This header is required for cross-origin isolation (enabling `SharedArrayBuffer`, `performance.measureUserAgentSpecificMemory`), and without it, the page is vulnerable to certain cross-origin information leaks. Combined with the absent CSP (a02-f01), the isolation posture of the application is weak.",
+      "evidence": {
+        "code_snippet": "app.use(helmet({\n  contentSecurityPolicy: false,\n  crossOriginEmbedderPolicy: false\n}));",
+        "response_snippet": "curl -sI http://localhost:3000/ | grep -i cross-origin-embedder\n(no output — header absent)"
+      },
+      "reproduction_steps": [
+        "curl -sI http://localhost:3000/ | grep -i embedder",
+        "Observe header is absent"
+      ],
+      "impact": "Low — primarily affects side-channel attack mitigations (Spectre) and SharedArrayBuffer usage. Not directly exploitable without other conditions.",
+      "suggested_fix": "Remove `crossOriginEmbedderPolicy: false` from the helmet call to re-enable the default `require-corp` policy, or set it explicitly to `{ policy: 'require-corp' }`.",
+      "needs_poc": false
+    },
+    {
+      "id": "a02-f19",
+      "title": "express.json body parser allows 10MB request bodies — denial of service amplifier",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A02",
+      "cwe": "CWE-400",
+      "location": {
+        "file": "src/index.js",
+        "line": 56
+      },
+      "description": "The JSON body parser is configured with `limit: '10mb'`. This allows any unauthenticated request to submit a 10MB JSON payload, which will be fully parsed before any authentication or authorization check runs. This is a low-severity DoS amplifier — an attacker can send many large requests to exhaust memory or CPU on JSON parsing.",
+      "evidence": {
+        "code_snippet": "app.use(express.json({ limit: '10mb' }));",
+        "response_snippet": "# Generate a 10MB JSON body and send it to any unauthenticated endpoint\npython3 -c \"import json; print(json.dumps({'a': 'x'*10000000}))\" | curl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d @-"
+      },
+      "reproduction_steps": [
+        "Send a 10MB JSON payload to any API endpoint before authentication runs",
+        "Observe the server accepts and parses the full body"
+      ],
+      "impact": "Low — memory/CPU exhaustion under sustained attack without rate limiting compensation. Not directly exploitable for data access.",
+      "suggested_fix": "Reduce the JSON body limit to a reasonable size for the API (e.g. `100kb`). Only allow larger payloads on specific endpoints that genuinely require them (file upload endpoints should use multipart, not JSON).",
+      "needs_poc": false
+    }
+  ]
+}

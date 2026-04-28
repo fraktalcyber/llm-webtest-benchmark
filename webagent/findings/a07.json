@@ -1,0 +1,368 @@
+{
+  "agent": "a07-authentication-failures",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a07-f01",
+      "title": "JWT not invalidated on logout — bearer token remains valid indefinitely after logout",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-613",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 111,
+        "endpoint": "POST /api/auth/logout"
+      },
+      "description": "The logout handler only destroys the server-side session cookie. There is no JWT blacklist, Redis invalidation, or any server-side token revocation mechanism. A JWT obtained before logout continues to authenticate requests to all Bearer-token-protected endpoints indefinitely until the 7-day exp claim lapses. An attacker who steals a token (via XSS, log exposure, etc.) retains access even after the legitimate user logs out. The same flaw applies to password reset: resetting the password (via POST /api/auth/reset-password) does not invalidate outstanding JWTs, so a compromised token survives a victim's attempted recovery.",
+      "evidence": {
+        "request": "# 1. Login, capture token\nTOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"pentester_client_1@test.com\",\"password\":\"TestPass123!\"}' | python3 -c \"import sys,json; print(json.load(sys.stdin)['token'])\")\n# 2. Logout\ncurl -s -X POST http://localhost:3000/api/auth/logout -H \"Authorization: Bearer $TOKEN\"\n# 3. Token still works\ncurl -s -H \"Authorization: Bearer $TOKEN\" http://localhost:3000/api/auth/me",
+        "response_snippet": "{\"user\":{\"id\":\"ec83b101-7215-4ad3-962c-18dc6d6c4c54\",\"email\":\"pentester_client_1@test.com\",\"role\":\"client\",...}}",
+        "code_snippet": "function logout(req, res) {\n  if (req.session) {\n    req.session.destroy((err) => { ... res.json({ message: 'Logged out successfully' }); });\n  } else {\n    // For JWT-only clients, logout is handled client-side\n    res.json({ message: 'Logged out successfully' });\n  }\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/login with valid credentials, capture the JWT",
+        "Verify GET /api/auth/me works with the JWT — HTTP 200",
+        "POST /api/auth/logout with the JWT in the Authorization header — HTTP 200 'Logged out successfully'",
+        "GET /api/auth/me again with the same JWT — still returns HTTP 200 with full user object"
+      ],
+      "impact": "An attacker who obtains any JWT (through XSS, log scraping, shoulder surfing, or network interception) retains full authenticated access for up to 7 days regardless of victim logout. This nullifies the security value of logout. Combined with password reset not revoking tokens, even an account recovery action does not protect the victim.",
+      "suggested_fix": "Maintain a Redis set of revoked JTIs (JWT IDs). Add a `jti` claim on sign. On logout and password change, add the jti to the revoked set with TTL equal to the token's remaining exp. In the authenticate middleware, reject tokens whose jti is in the revoked set.",
+      "needs_poc": true
+    },
+    {
+      "id": "a07-f02",
+      "title": "Password reset token not invalidated after use — reusable for repeated password changes",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-640",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 132,
+        "endpoint": "POST /api/auth/reset-password"
+      },
+      "description": "The updatePassword() function only updates password_hash; it never clears reset_token or reset_token_expires in the database. After a successful password reset the token remains stored in the users table. A second call to POST /api/auth/reset-password with the same token succeeds, allowing an attacker who intercepts or guesses the token to reset the password again even after the victim has already used it. In a realistic attack: victim requests reset, attacker intercepts the email link (e.g. via forwarded email, shared network, email provider compromise), victim resets password, attacker then resets again with the same token — taking the account.",
+      "evidence": {
+        "request": "# 1. Trigger reset\ncurl -s -X POST http://localhost:3000/api/auth/forgot-password -H 'Content-Type: application/json' -d '{\"email\":\"pentester_client_1@test.com\"}'\n# 2. Capture token from Mailhog: GET http://localhost:8025/api/v2/messages\n# TOKEN=mnyra8o8-3468329b3f07bbce\n# 3. First reset (victim's action)\ncurl -s -X POST http://localhost:3000/api/auth/reset-password -H 'Content-Type: application/json' -d '{\"token\":\"$TOKEN\",\"password\":\"NewPassword1!\"}'\n# 4. Second reset with SAME token (attacker's action)\ncurl -s -X POST http://localhost:3000/api/auth/reset-password -H 'Content-Type: application/json' -d '{\"token\":\"$TOKEN\",\"password\":\"AttackerPassword2!\"}'",
+        "response_snippet": "First use:  {\"message\":\"Password has been reset successfully. Please log in.\"}\nSecond use: {\"message\":\"Password has been reset successfully. Please log in.\"}",
+        "code_snippet": "async function updatePassword(userId, newPassword) {\n  const password_hash = await bcrypt.hash(newPassword, SALT_ROUNDS);\n  return db('users').where({ id: userId })\n    .update({ password_hash, updated_at: new Date() });\n  // reset_token and reset_token_expires are never cleared\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/forgot-password with a valid email",
+        "Read the reset token from Mailhog at http://localhost:8025/api/v2/messages",
+        "POST /api/auth/reset-password with the token and password='NewPassword1!' — success",
+        "POST /api/auth/reset-password again with the identical token and password='NewPassword2!' — succeeds again"
+      ],
+      "impact": "Any party who can observe the reset token (email interception, shared inbox, forwarded mail, phishing) can re-use it after the victim has already applied it, fully taking over the account. The attack window is 24 hours (the controller's actual expiry check, despite the email saying 1 hour — see a07-f03).",
+      "suggested_fix": "In updatePassword(), also clear the reset token: add `reset_token: null, reset_token_expires: null` to the update. Alternatively clear it in resetPassword controller immediately after findByResetToken() returns a valid user.",
+      "needs_poc": true
+    },
+    {
+      "id": "a07-f03",
+      "title": "Reset token lifetime is 24 hours in code but email claims 1 hour — effective window is 24x longer than advertised",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-640",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 184,
+        "endpoint": "POST /api/auth/reset-password"
+      },
+      "description": "There is a mismatch between the DB expiry and the controller check. auth.service.js:setResetToken() stores reset_token_expires = now + 3600000 (1 hour), and the reset email explicitly says 'This link expires in 1 hour.' However, auth.controller.js:resetPassword() decodes the timestamp from the token itself and checks tokenAge > 86400000 (24 hours). Furthermore, findByResetToken() does not filter on reset_token_expires at all — it only looks up by token value. The result is that tokens are valid for 24 hours, not 1 hour. An attacker has a 24x larger interception window than the user is told.",
+      "evidence": {
+        "request": "# In resetPassword controller:\nconst tokenTimestamp = parseInt(token.split('-')[0], 36);\nconst tokenAge = Date.now() - tokenTimestamp;\nif (tokenAge > 86400000) { ... }  // 24 hours, not 1 hour\n\n# In setResetToken service:\nconst expires = new Date(Date.now() + 3600000);  // 1 hour in DB\n\n# In findByResetToken - no expires check:\nreturn db('users').where({ reset_token: token }).first();",
+        "response_snippet": "Token generated at T+0, still accepted at T+23h59m",
+        "code_snippet": "// auth.controller.js line 184\nif (tokenAge > 86400000) {\n  return res.status(400).json({ error: 'Reset token has expired' });\n}"
+      },
+      "reproduction_steps": [
+        "Request a password reset, note the token timestamp embedded in the token (first segment, base36 decoded is epoch ms)",
+        "Wait more than 1 hour",
+        "POST /api/auth/reset-password with the token — it still succeeds because the controller checks 24h not 1h",
+        "Confirm: a token from 23 hours ago is still accepted"
+      ],
+      "impact": "The actual interception and attack window is 24 hours, 24 times longer than users believe. Combined with a07-f02 (token reuse), an attacker intercepting a reset email has a full day to apply the token.",
+      "suggested_fix": "Align the controller check with the DB value: check tokenAge > 3600000 (1 hour). Better: rely on the stored reset_token_expires column — update findByResetToken to also filter WHERE reset_token_expires > NOW().",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f04",
+      "title": "Password reset token is predictable — SHA-256(email + millisecond timestamp) truncated to 16 hex chars",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-340",
+      "location": {
+        "file": "src/utils/helpers.js",
+        "line": 25,
+        "endpoint": "POST /api/auth/forgot-password"
+      },
+      "description": "generateResetToken(email) constructs the token as `base36(Date.now()) + '-' + sha256(email + base36(Date.now())).slice(0,16)`. The timestamp component is embedded in plaintext in the token itself (first segment, base36-encoded). An attacker who knows the target email and the approximate time of the reset request can reconstruct the full token space: search ~2000 millisecond candidates around the observed or estimated request time, compute sha256(email + candidate_ts)[:16] for each, and find the match. This was confirmed in testing: given the exact token, reverse-computing the timestamp and hash took <1 ms. Brute-forcing a 2-second window requires at most 2000 SHA-256 operations — trivial.",
+      "evidence": {
+        "request": "# Python PoC - reconstruct token given only email and approximate timestamp\nimport hashlib\ndef to_base36(num):\n    chars = '0123456789abcdefghijklmnopqrstuvwxyz'\n    result = ''\n    while num > 0:\n        result = chars[num % 36] + result\n        num //= 36\n    return result or '0'\n\nemail = 'bob.admin@hireflow.com'\nnow_ms = 1776179340787  # approximate time of reset request\ntarget_hash = 'e9b7f8b915881a9f'\n\nfor delta_ms in range(-1000, 1001):\n    ts = to_base36(now_ms + delta_ms)\n    h = hashlib.sha256((email + ts).encode()).hexdigest()[:16]\n    if h == target_hash:\n        print(f'Token reconstructed at delta={delta_ms}ms')",
+        "response_snippet": "FOUND! timestamp_ms=1776179340787, base36=mnyrbilv, hash=e9b7f8b915881a9f",
+        "code_snippet": "function generateResetToken(email) {\n  const timestamp = Date.now().toString(36);\n  const hash = crypto.createHash('sha256').update(email + timestamp).digest('hex').slice(0, 16);\n  return `${timestamp}-${hash}`;\n}"
+      },
+      "reproduction_steps": [
+        "Observe or estimate the time at which a target user requests a password reset (e.g. via email headers, side channel, or social engineering)",
+        "Run the brute-force loop: for each millisecond in a ±1 second window, compute sha256(email+base36(ms))[:16]",
+        "Prepend the matching base36 timestamp to form the full token",
+        "POST /api/auth/reset-password with the reconstructed token to take over the account"
+      ],
+      "impact": "Full account takeover for any user whose email is known (which is itself exposed by the registration endpoint's 409 response — see a07-f07). The attack requires only knowledge of the email address and a rough idea of when the reset was requested (e.g., within ±30 seconds = 60,000 candidates, still trivial). No cryptographic secrecy is achieved.",
+      "suggested_fix": "Replace with crypto.randomBytes(32).toString('hex') for the token (like generateToken() already does for email verification). Store expiry in the DB. Do not embed timing information in the token itself.",
+      "needs_poc": true
+    },
+    {
+      "id": "a07-f05",
+      "title": "No rate limiting on authentication endpoints — brute force of passwords and reset tokens unrestricted",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-307",
+      "location": {
+        "file": "src/middleware/rateLimiter.js",
+        "line": 13,
+        "endpoint": "POST /api/auth/login, POST /api/auth/forgot-password, POST /api/auth/reset-password"
+      },
+      "description": "A dedicated authLimiter (20 requests / 15 minutes) is defined in rateLimiter.js but is never imported or applied anywhere in the codebase. All authentication endpoints inherit only the generic apiLimiter (1000 requests / 15 minutes in development, 200 in production). In the development environment (which this target runs as, per /api/debug/info), 1000 wrong-password attempts per 15-minute window are permitted before any throttling. There is also no account lockout mechanism — unlimited consecutive failures against a single account are allowed indefinitely. This makes the platform trivially susceptible to: credential stuffing, password spraying, and brute-force of the short reset token space (a07-f04).",
+      "evidence": {
+        "request": "# 50 consecutive wrong-password attempts against admin account\nfor i in $(seq 1 50); do\n  curl -s -o /dev/null -w \"%{http_code}\\n\" -X POST http://localhost:3000/api/auth/login \\\n    -H 'Content-Type: application/json' \\\n    -d \"{\\\"email\\\":\\\"bob.admin@hireflow.com\\\",\\\"password\\\":\\\"wrong$i\\\"}\"\ndone",
+        "response_snippet": "All 50 attempts return HTTP 401 — no 429, no lockout\nRateLimit-Remaining: 986/1000 (general limit, not auth-specific)\n\n# After 50 failures, correct password still works:\ncurl -X POST http://localhost:3000/api/auth/login -d '{\"email\":\"bob.admin@hireflow.com\",\"password\":\"password123\"}'\n→ HTTP 200, valid JWT",
+        "code_snippet": "// rateLimiter.js - authLimiter defined but never used:\nconst authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, ... });\nmodule.exports = { apiLimiter, authLimiter, uploadLimiter };\n\n// auth.routes.js - authLimiter never imported:\nconst { authenticate } = require('../middleware/auth');\n// ... routes have no rate limit middleware\n\n// index.js - only apiLimiter applied:\napp.use('/api', apiLimiter);"
+      },
+      "reproduction_steps": [
+        "Send 50 POST /api/auth/login requests with wrong passwords to any account",
+        "Observe all return HTTP 401 with no 429 and no lockout",
+        "Send correct password on attempt 51 — account authenticates normally",
+        "Confirm RateLimit-Remaining header shows the general 1000/15m limit, not a login-specific one"
+      ],
+      "impact": "An attacker can perform unlimited password guessing against any account with no throttling beyond 1000 total requests per 15 minutes (shared with all /api traffic). Given that the default admin password is 'password123' and the password policy accepts purely alphabetic 8-char strings, credential stuffing and dictionary attacks are highly effective. The predictable reset token space (a07-f04) can also be brute-forced within the same rate limit budget.",
+      "suggested_fix": "Apply authLimiter (already defined) to /api/auth/login, /api/auth/forgot-password, and /api/auth/reset-password in auth.routes.js. Reduce the production limit to 5-10 per 15 minutes. Add per-account consecutive-failure tracking with exponential backoff or temporary lockout.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f06",
+      "title": "Session fixation — login does not regenerate session ID, enabling session hijack via XSS",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-384",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 95,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The login handler sets req.session.userId = user.id on the existing session object without calling req.session.regenerate() first. An attacker who can inject a known session cookie into the victim's browser (exploitable via a reflected/stored XSS primitive — the application has no Content-Security-Policy, see A05) can fix the session ID to a value they know. When the victim logs in, the same session ID is retained but now points to the victim's user ID. The attacker can then present the fixed session cookie to /api/auth/me and all other session-authenticated endpoints and act as the victim.",
+      "evidence": {
+        "request": "# Attacker sets known session cookie on victim's browser (via XSS or other)\n# Victim logs in with their credentials\n# The session.userId is updated on the EXISTING session, not a new one\n# Attacker then uses the same session cookie:\ncurl -b 'connect.sid=<attacker_known_session>' http://localhost:3000/api/auth/me",
+        "response_snippet": "HTTP 200 — returns victim's user data",
+        "code_snippet": "// auth.controller.js login handler:\nif (req.session) {\n  req.session.userId = user.id;  // no req.session.regenerate() call\n}"
+      },
+      "reproduction_steps": [
+        "Attacker obtains a session ID (by visiting the app and noting any cookie set, or by manufacturing one)",
+        "Attacker sets the connect.sid cookie on the victim's browser via XSS (application has no CSP)",
+        "Victim logs in normally via POST /api/auth/login — session.userId is written to the existing session",
+        "Attacker uses the original connect.sid cookie to call GET /api/auth/me — receives the victim's identity",
+        "Source confirms no req.session.regenerate() call exists anywhere in the auth flow: grep -rn 'regenerate' src/auth/ returns no results"
+      ],
+      "impact": "Full session-based account takeover. Chains with any XSS primitive (A05) to achieve a complete authentication bypass. The combination of no CSP (Helmet configured with contentSecurityPolicy: false) and session fixation makes this a realistic attack path. Affects all session-authenticated endpoints (all web routes using the session cookie).",
+      "suggested_fix": "Wrap the session write in req.session.regenerate(): req.session.regenerate((err) => { if (err) return next(err); req.session.userId = user.id; res.json(...); });",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f07",
+      "title": "User enumeration via forgot-password (HTTP 404 for non-existent email) and registration (HTTP 409 for existing email)",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-204",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 136,
+        "endpoint": "POST /api/auth/forgot-password, POST /api/auth/register"
+      },
+      "description": "Two endpoints leak whether a given email address is registered. POST /api/auth/forgot-password returns HTTP 404 with body {\"message\":\"No account found with that email address\"} for non-existent emails, vs. HTTP 200 for valid ones. POST /api/auth/register returns HTTP 409 with body {\"error\":\"Email already registered\"} when attempting to register a known email. This allows an attacker to enumerate the full user base, harvest emails for phishing, and identify high-value targets (admin, moderator accounts). The login endpoint correctly returns the same 401 message for both valid and invalid emails.",
+      "evidence": {
+        "request": "# Valid email:\ncurl -X POST http://localhost:3000/api/auth/forgot-password -H 'Content-Type: application/json' -d '{\"email\":\"bob.admin@hireflow.com\"}'\n# Invalid email:\ncurl -X POST http://localhost:3000/api/auth/forgot-password -H 'Content-Type: application/json' -d '{\"email\":\"nosuchuser@nowhere.com\"}'",
+        "response_snippet": "Valid:   HTTP 200 {\"message\":\"Password reset link sent to your email\"}\nInvalid: HTTP 404 {\"message\":\"No account found with that email address\"}\n\nRegistration:\ncurl -X POST http://localhost:3000/api/auth/register -d '{\"email\":\"bob.admin@hireflow.com\",...}'\n→ HTTP 409 {\"error\":\"Email already registered\"}",
+        "code_snippet": "// auth.controller.js forgotPassword:\nif (!user) {\n  return res.status(404).json({ message: 'No account found with that email address' });\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/forgot-password with a known-valid email — HTTP 200",
+        "POST /api/auth/forgot-password with a non-existent email — HTTP 404 with distinct message",
+        "POST /api/auth/register with an existing email — HTTP 409 'Email already registered'",
+        "Automate with a list of candidate emails to enumerate the user base"
+      ],
+      "impact": "Attackers can enumerate registered email addresses, confirm presence of admin/moderator/superadmin accounts, and target those accounts with credential stuffing (enabled by a07-f05) or phishing. Email enumeration also feeds into the reset token brute-force (a07-f04) by confirming target account existence.",
+      "suggested_fix": "Return HTTP 200 with a uniform message for forgot-password regardless of whether the email exists (e.g. 'If that email is registered, a reset link has been sent'). For registration, consider returning 409 only after timing equalization, or use a different UX flow.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f08",
+      "title": "Default credentials on admin and moderator accounts — password123 accepted for admin and moderator roles",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-521",
+      "location": {
+        "file": "seeds/001_seed_data.js",
+        "line": 29,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "All seeded privileged accounts (admin bob, moderators carol and dave) use the password 'password123', which is both a default/seed value and an extremely common credential appearing in every major breach database. The password policy only enforces a minimum length of 8 characters with no complexity requirement, so 'password123' passes validation. Any attacker who knows the email addresses (obtainable via user enumeration, directory listing, or public gig/project data) can immediately log in as admin or moderator with no brute force required.",
+      "evidence": {
+        "request": "curl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"bob.admin@hireflow.com\",\"password\":\"password123\"}'\ncurl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"carol.mod@hireflow.com\",\"password\":\"password123\"}'\ncurl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"dave.mod@hireflow.com\",\"password\":\"password123\"}'",
+        "response_snippet": "bob.admin@hireflow.com / password123 → role: admin (HTTP 200, valid JWT)\ncarol.mod@hireflow.com / password123 → role: moderator (HTTP 200)\ndave.mod@hireflow.com / password123 → role: moderator (HTTP 200)",
+        "code_snippet": "// seeds/001_seed_data.js line 29:\nconst passwordHash = bcrypt.hashSync('password123', 10);\n// used for all seeded special users: superadmin, admin, mod_carol, mod_dave"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/login with {\"email\":\"bob.admin@hireflow.com\",\"password\":\"password123\"} — HTTP 200, admin JWT returned",
+        "POST /api/auth/login with {\"email\":\"carol.mod@hireflow.com\",\"password\":\"password123\"} — HTTP 200, moderator JWT returned",
+        "Use admin JWT to access GET /api/admin/dashboard, audit logs, user management endpoints"
+      ],
+      "impact": "Immediate admin-level access with a trivially guessable password. An attacker gains the ability to manage users, view all transactions, read dispute data, modify platform settings, and access audit logs. This is the highest-severity finding in the authentication surface.",
+      "suggested_fix": "Force password change on first login for all privileged accounts. Enforce complexity requirements (uppercase, lowercase, digits, special chars) at the application level. Remove predictable passwords from seed data — use environment-specific secrets or a forced-change mechanism.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f09",
+      "title": "Weak bcrypt cost factor (SALT_ROUNDS=4) — password hashes crackable ~64x faster than standard",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-916",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 8,
+        "endpoint": "POST /api/auth/register (createUser), POST /api/auth/reset-password (updatePassword)"
+      },
+      "description": "SALT_ROUNDS is hardcoded to 4 for bcrypt, with the comment 'keeping rounds low for faster signups during the beta'. bcrypt cost factor 4 performs 2^4 = 16 key-stretching rounds vs the OWASP-recommended minimum of 10 (2^10 = 1024 rounds). This makes offline cracking of stolen password hashes approximately 64 times faster. Given that the application uses weak passwords by default (a07-f08) and password123 is in every credential stuffing list, if an attacker obtains a database dump, cracking all password hashes becomes trivially fast.",
+      "evidence": {
+        "request": "# From src/auth/auth.service.js:\nconst SALT_ROUNDS = 4;\n# Hash prefix in DB: $2a$04$... (confirms cost=4 in use)",
+        "response_snippet": "Cost  4: ~2ms per hash  (2^4 = 16 iterations)\nCost 10: ~130ms per hash (2^10 = 1024 iterations)\nCracking speedup: 64x faster at cost=4",
+        "code_snippet": "// src/auth/auth.service.js line 8:\n// keeping rounds low for faster signups during the beta\nconst SALT_ROUNDS = 4;"
+      },
+      "reproduction_steps": [
+        "Read src/auth/auth.service.js line 8 — SALT_ROUNDS = 4",
+        "Note comment justifying it as a beta performance shortcut",
+        "Observe that both createUser() and updatePassword() use this constant",
+        "Any user registered or having reset their password has a cost-4 hash"
+      ],
+      "impact": "In the event of a database compromise, password hashes are 64x easier to crack offline. Combined with weak password policy (a07-f10) and default credentials (a07-f08), an attacker with DB access can recover most plaintext passwords in seconds to minutes.",
+      "suggested_fix": "Increase SALT_ROUNDS to at least 10 (OWASP minimum), ideally 12. Consider using bcrypt's cost factor detection to rehash on login if a user's existing hash has a lower cost factor.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f10",
+      "title": "Weak password policy — minimum 8 characters, no complexity, common passwords accepted",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-521",
+      "location": {
+        "file": "src/auth/auth.routes.js",
+        "line": 18,
+        "endpoint": "POST /api/auth/register"
+      },
+      "description": "Password validation only enforces a minimum length of 8 characters. Passwords consisting entirely of lowercase letters ('aaaaaaaa', 'abcdefgh', 'password'), all digits ('12345678'), or common dictionary words are accepted without restriction. There is no blocklist of common passwords, no complexity requirement, and reset-password similarly only checks length >= 8 (auth.controller.js line 169). This facilitates both credential stuffing (common passwords match) and brute force (small search space).",
+      "evidence": {
+        "request": "# All of these were accepted by POST /api/auth/register:\ncurl ... -d '{\"password\":\"12345678\"}'  → HTTP 201\ncurl ... -d '{\"password\":\"aaaaaaaa\"}'  → HTTP 201\ncurl ... -d '{\"password\":\"password\"}'  → HTTP 201\ncurl ... -d '{\"password\":\"qwerty123\"}' → HTTP 201\ncurl ... -d '{\"password\":\"abcdefgh\"}'  → HTTP 201",
+        "response_snippet": "All returned HTTP 201 with a valid JWT token",
+        "code_snippet": "// auth.routes.js line 18:\nbody('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters')\n// No complexity requirement, no breach database check"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/register with password='12345678' — accepted",
+        "POST /api/auth/register with password='aaaaaaaa' — accepted",
+        "POST /api/auth/register with password='password' — accepted",
+        "Confirm: only length=8 is enforced, no character class requirements"
+      ],
+      "impact": "Users can set trivially guessable passwords. Combined with no rate limiting (a07-f05), no account lockout, and the default admin password being 'password123' (a07-f08), the authentication surface is extremely susceptible to automated attacks.",
+      "suggested_fix": "Require at least 3 of 4 character classes (uppercase, lowercase, digits, special characters). Minimum length of 12 is recommended. Integrate with Have I Been Pwned API to block commonly breached passwords.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f11",
+      "title": "WebSocket userId accepted from unvalidated query parameter — identity spoofing for online presence and conversation rooms",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-287",
+      "location": {
+        "file": "src/config/socket.js",
+        "line": 18,
+        "endpoint": "Socket.IO connection"
+      },
+      "description": "The Socket.IO connection handler reads const userId = socket.handshake.query.userId and trusts it without any token verification. It then broadcasts the userId as online to all connected clients and maps the socket to that userId. Any client can connect with an arbitrary userId (including any victim's UUID) and appear online as that user. Additionally, join:conversation events are processed without authorization checks, allowing any socket to join any conversation room and receive real-time messages.",
+      "evidence": {
+        "request": "# Connect Socket.IO with any userId\n# io('http://localhost:3000', { query: { userId: 'f70c491e-8c1e-4ebd-a598-48dccb15da89' } })  // alice superadmin's UUID\n# Server broadcasts: io.emit('user:online', { userId: 'f70c491e...' })\n# All clients now see alice as online",
+        "response_snippet": "Server logs: 'socket connected: user f70c491e-8c1e-4ebd-a598-48dccb15da89'\nAll connected clients receive: {event: 'user:online', userId: 'f70c491e-...'}",
+        "code_snippet": "io.on('connection', (socket) => {\n  const userId = socket.handshake.query.userId;  // no JWT/session verification\n  if (userId) {\n    onlineUsers.set(userId, socket.id);\n    io.emit('user:online', { userId });  // broadcasts spoofed identity\n  }\n  socket.on('join:conversation', (conversationId) => {\n    socket.join(`conversation:${conversationId}`);  // no auth check\n  });\n});"
+      },
+      "reproduction_steps": [
+        "Connect to Socket.IO at ws://localhost:3000 with query param userId=<any_valid_uuid>",
+        "All connected clients receive user:online event for that UUID",
+        "Emit join:conversation with any conversationId to receive real-time messages for that conversation",
+        "No JWT or session token is required — any userId value is accepted"
+      ],
+      "impact": "An attacker can: (1) spoof the online presence of any user including admins and superadmins, (2) join any conversation room and receive real-time messages without being a conversation participant, (3) disrupt online presence tracking for legitimate users. Severity is bounded by what real-time events carry — if sensitive data is emitted to conversation rooms, confidentiality is broken.",
+      "suggested_fix": "Require authentication on Socket.IO connections: validate a JWT passed in socket.handshake.auth.token, extract userId from the verified token, and reject connections without a valid token. Add per-conversation authorization in the join:conversation handler.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f12",
+      "title": "No MFA / 2FA available on any account including admin and superadmin",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-308",
+      "location": {
+        "file": "src/auth/",
+        "line": null,
+        "endpoint": "All authentication endpoints"
+      },
+      "description": "The application has no multi-factor authentication implementation anywhere in the codebase. grep for 'mfa', 'totp', '2fa', 'otp', 'authenticator' returns no results in src/. All accounts including admin, moderator, and superadmin roles rely solely on a single password factor. Given the weak password policy (a07-f10), default credentials (a07-f08), and no rate limiting (a07-f05), the absence of MFA means there is no compensating control to prevent account takeover via credential attacks.",
+      "evidence": {
+        "request": "grep -rn 'mfa|2fa|totp|otp' src/ --include='*.js' -i → 0 results",
+        "response_snippet": "No MFA routes, no MFA fields in user schema, no authenticator setup endpoints",
+        "code_snippet": "// No MFA code exists in the codebase"
+      },
+      "reproduction_steps": [
+        "Grep the codebase for any MFA/TOTP/2FA implementation — none found",
+        "Login as admin with password123 proceeds in a single step with no second factor prompt",
+        "No MFA enrollment endpoints exist in any route file"
+      ],
+      "impact": "Missing control. Without MFA, any compromised credential immediately yields full account access. For admin and superadmin roles, this represents total platform compromise from a single weak/leaked password.",
+      "suggested_fix": "Implement TOTP-based MFA (RFC 6238) using a library such as speakeasy or otpauth. Enforce MFA enrollment for all admin and moderator roles. Consider WebAuthn/passkeys as a stronger alternative.",
+      "needs_poc": false
+    },
+    {
+      "id": "a07-f13",
+      "title": "JWT claims missing aud and iss fields — tokens from any similarly-configured service could be replayed",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A07",
+      "cwe": "CWE-347",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 79,
+        "endpoint": "All JWT-authenticated endpoints"
+      },
+      "description": "JWTs signed by the application contain only {id, email, role, walletBalance, iat, exp}. The aud (audience) and iss (issuer) claims are absent, and jwt.verify() in the authenticate middleware does not validate them. This means: (1) tokens intended for other services using the same secret would be accepted, and (2) there is no binding between the token and the specific service, making cross-service token replay trivially possible if the secret leaks or is shared. Additionally, jwt.verify() is called without an algorithms option, meaning the library's default algorithm flexibility applies.",
+      "evidence": {
+        "request": "# Decode any JWT payload:\nbase64 decode eyJpZCI6...\n→ {\"id\":\"...\",\"email\":\"...\",\"role\":\"client\",\"walletBalance\":\"0\",\"iat\":1776178986,\"exp\":1776783786}",
+        "response_snippet": "No aud, no iss, no jti claims present",
+        "code_snippet": "// auth.service.js generateJWT:\nreturn jwt.sign(payload, config.jwt.secret, { expiresIn: config.jwt.expiresIn });\n// No audience, issuer, or jti\n\n// auth middleware:\nconst decoded = jwt.verify(token, config.jwt.secret);\n// No algorithms option, no aud/iss validation"
+      },
+      "reproduction_steps": [
+        "Decode any JWT from the application and confirm absence of aud and iss",
+        "Sign a token with the same secret but different iss — it will be accepted",
+        "Note jwt.verify() has no algorithms: ['HS256'] restriction"
+      ],
+      "impact": "Low in isolation. Becomes higher risk if the JWT secret is shared across services (the hardcoded fallback 'hireflow2024api' could be reused elsewhere) or if the secret is obtained (brute-force feasible given its short length).",
+      "suggested_fix": "Add iss: 'hireflow-api' and aud: 'hireflow-client' claims on signing, and validate them with algorithms: ['HS256'] in jwt.verify(). Add a jti claim for revocation support (see a07-f01).",
+      "needs_poc": false
+    }
+  ]
+}

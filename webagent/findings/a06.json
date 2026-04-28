@@ -1,0 +1,292 @@
+{
+  "agent": "a06-insecure-design",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a06-f01",
+      "title": "Payment webhook credits arbitrary user wallets without signature verification (signature field is optional)",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-306",
+      "location": {
+        "file": "src/integrations/webhook.service.js",
+        "line": 19,
+        "endpoint": "POST /api/webhooks/payment"
+      },
+      "description": "The payment webhook handler only verifies the HMAC signature when the `x-payment-signature` header is present. If the header is absent, the check is skipped entirely and the payload is processed unconditionally. An attacker can POST to the unauthenticated endpoint without any header and credit an arbitrary user's wallet with any amount. The design intent is clear from the comment ('They sign the payload with a shared secret'), but the `if (signature) { ... }` guard makes signature presence optional rather than required.",
+      "evidence": {
+        "request": "curl -s -X POST http://localhost:3000/api/webhooks/payment -H 'Content-Type: application/json' -d '{\"event\":\"payment.completed\",\"data\":{\"user_id\":\"ec83b101-7215-4ad3-962c-18dc6d6c4c54\",\"amount\":100000,\"description\":\"hacked credit\"}}'",
+        "response_snippet": "{\"received\":true,\"result\":{\"processed\":true,\"event\":\"payment.completed\"}}",
+        "wallet_before": "balance: 0",
+        "wallet_after": "balance: 100000",
+        "code_snippet": "const signature = headers['x-payment-signature'];\nif (signature) {\n  const expected = crypto.createHmac('sha256', config.session.secret).update(JSON.stringify(payload)).digest('hex');\n  if (signature !== expected) { throw new Error('Invalid signature'); }\n}"
+      },
+      "reproduction_steps": [
+        "Identify any target user's UUID (available from public /api/users endpoint)",
+        "POST to http://localhost:3000/api/webhooks/payment with no Authorization header and no x-payment-signature header",
+        "Body: {\"event\":\"payment.completed\",\"data\":{\"user_id\":\"<target-uuid>\",\"amount\":999999999,\"description\":\"test\"}}",
+        "Observe wallet balance increases by the specified amount",
+        "No signature required, no authentication required, no rate limit specific to this endpoint"
+      ],
+      "impact": "Unauthenticated attacker can credit any user's wallet with unlimited funds. This completely breaks the financial integrity of the platform. Combined with the missing idempotency check (see a06-f02), the same event can be replayed multiple times.",
+      "suggested_fix": "Remove the conditional check. Always require and verify the signature: if (!signature || signature !== expected) { return 400/401 }. Also add the webhook endpoint to a stricter rate limiter.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f02",
+      "title": "Payment webhook has no idempotency — duplicate events credit wallet multiple times",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-841",
+      "location": {
+        "file": "src/integrations/webhook.service.js",
+        "line": 32,
+        "endpoint": "POST /api/webhooks/payment"
+      },
+      "description": "The `payment.completed` webhook handler credits the user's wallet without checking whether the `reference_id` has already been processed. Sending the same webhook payload a second time results in a second wallet credit. A legitimate payment gateway will retry webhook delivery on network failure; without an idempotency key check, each retry is processed as a new payment.",
+      "evidence": {
+        "request_1": "POST /api/webhooks/payment {\"event\":\"payment.completed\",\"data\":{\"user_id\":\"db734f89...\",\"amount\":10000}}",
+        "request_2": "Same payload sent again",
+        "balance_before": "467999",
+        "balance_after": "487999",
+        "balance_increase": "+20000 (10000 x 2)"
+      },
+      "reproduction_steps": [
+        "POST to /api/webhooks/payment twice with the identical payload",
+        "Check wallet balance — it increases by amount * 2",
+        "No deduplication occurs even when the same reference_id is provided"
+      ],
+      "impact": "Every replayed webhook event double-credits the wallet. An attacker who can trigger retries (e.g. by causing network errors during initial delivery) or who has broken the signature check (a06-f01) can multiply credits indefinitely.",
+      "suggested_fix": "Before crediting the wallet, query the transactions table for an existing row with the same reference_id and type='deposit'. If found, return 200 without processing. Store reference_id as NOT NULL UNIQUE for external payment events.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f03",
+      "title": "Milestone approval has no actor authorization check — any authenticated user can approve any milestone",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-285",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 310,
+        "endpoint": "PUT /api/contracts/:id/milestones/:milestoneId/approve"
+      },
+      "description": "The `approveMilestone` function only checks that the milestone status is 'submitted'. It does not verify that the caller is the client on the contract. This allows: (1) the freelancer to self-approve their own submitted deliverable, (2) any other authenticated user (moderator, admin, or even a random client on an unrelated contract) to approve milestones on any contract. After approval, the client must still call release-escrow (which does check client_id), but the approval state gates the release, so self-approval effectively coerces the client into being able to release funds.",
+      "evidence": {
+        "setup": "Create contract (CLIENT + FREELANCER). Fund escrow. FREELANCER submits deliverable.",
+        "request": "curl -X PUT http://localhost:3000/api/contracts/{c_id}/milestones/{m_id}/approve -H 'Authorization: Bearer $FREELANCER'",
+        "response_snippet": "{\"status\":\"approved\",\"approved_at\":\"2026-04-14T15:10:17.268Z\",...}",
+        "also_confirmed": "Moderator (not party to contract) also successfully approved a milestone in a separate test"
+      },
+      "reproduction_steps": [
+        "As CLIENT, create a contract with FREELANCER and fund the escrow milestone",
+        "As FREELANCER, POST to /api/contracts/{id}/milestones/{mid}/submit",
+        "As FREELANCER (same user who submitted), PUT to /api/contracts/{id}/milestones/{mid}/approve",
+        "Response: 200 with status=approved — freelancer has self-approved their own work",
+        "The milestone is now in state that allows the client to release payment without independent review"
+      ],
+      "impact": "Freelancer can bypass the client review step. While the freelancer cannot self-release escrow, a malicious freelancer can pre-approve their milestone then pressure or trick the client into releasing. Any authenticated user on the platform can approve any milestone on any contract, enabling coordinated fraud.",
+      "suggested_fix": "In approveMilestone, verify that userId === contract.client_id before approving. Return 403 otherwise.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f04",
+      "title": "Escrow release accepts client-supplied amount override without upper-bound validation",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-20",
+      "location": {
+        "file": "src/payments/payments.service.js",
+        "line": 228,
+        "endpoint": "POST /api/payments/escrow/release/:milestoneId"
+      },
+      "description": "The `releaseEscrow` function accepts an optional `overrideAmount` parameter. When provided, it is used as-is instead of the milestone's actual funded amount. There is no validation that the override does not exceed the milestone amount, does not exceed the client's pending_balance, and is not negative. A client can release far more than was funded (extracting money that belongs to other contracts), or release a negative amount which *subtracts* from the freelancer's wallet.",
+      "evidence": {
+        "milestone_funded_amount": "5000 cents",
+        "request": "curl -X POST http://localhost:3000/api/payments/escrow/release/{mid} -H 'Authorization: Bearer $CLIENT' -d '{\"amount\": 9999.99}'",
+        "response_payout": "899999 cents (= $8999.99) instead of 4500 cents",
+        "negative_override_test": "curl -d '{\"amount\": -500}' -> payout: -45000, platformFee: -5000 -> freelancer balance decreased by 45000"
+      },
+      "reproduction_steps": [
+        "Create contract with milestone of amount 5000 (= $50). Fund the escrow.",
+        "Submit deliverable (FREELANCER), approve milestone (CLIENT).",
+        "POST to /api/payments/escrow/release/{milestoneId} with body {\"amount\": 9999.99}",
+        "Response shows payout=899999 — freelancer receives $8999.99 from a $50 milestone",
+        "Alternatively, send amount: -500 — freelancer's balance decreases by 45000"
+      ],
+      "impact": "Client can inflate payout to any arbitrary amount, draining the platform's pending balance pool belonging to other contracts. Client can also send a negative override to maliciously reduce a freelancer's earnings. The feature comment says 'partial releases for milestone adjustments' but there is no upper bound or sign check.",
+      "suggested_fix": "Remove the override-amount feature entirely, or if partial releases are needed, clamp: `const amount = Math.min(Math.max(overrideAmount, 1), milestone.amount)`. Also verify that the client's pending_balance is sufficient for the requested amount.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f05",
+      "title": "Contract status update has no actor authorization — any authenticated user can cancel any contract",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-285",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 150,
+        "endpoint": "PUT /api/contracts/:id/status"
+      },
+      "description": "The `updateContractStatus` function validates state transitions but does not check whether the calling user is a party to the contract. Any authenticated user can cancel, dispute, or mark-completed any contract on the platform by calling PUT /api/contracts/:id/status with an appropriate status value.",
+      "evidence": {
+        "request_freelancer": "curl -X PUT http://localhost:3000/api/contracts/{c_id}/status -H 'Authorization: Bearer $FREELANCER' -d '{\"status\":\"cancelled\"}' -> 200 OK, contract cancelled",
+        "request_mod": "curl -X PUT http://localhost:3000/api/contracts/{c_id}/status -H 'Authorization: Bearer $MOD' -d '{\"status\":\"cancelled\"}' -> 200 OK, contract cancelled by moderator who was not a party"
+      },
+      "reproduction_steps": [
+        "As CLIENT, create a contract between CLIENT and FREELANCER",
+        "As FREELANCER (or any other authenticated user), PUT /api/contracts/{id}/status with body {\"status\":\"cancelled\"}",
+        "Contract is cancelled immediately regardless of caller's role or relationship to the contract"
+      ],
+      "impact": "Any user can unilaterally cancel active contracts, disrupting payments and work. A malicious actor can cancel all pending contracts on the platform. A freelancer can cancel a contract to avoid a dispute ruling.",
+      "suggested_fix": "In updateContractStatus (or its controller), verify the userId is the client_id or freelancer_id on the contract. Add role-based rules: e.g. only client can cancel, either party can dispute, only moderator can force-complete.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f06",
+      "title": "Milestone amount can be updated by any authenticated user (no ownership check)",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-285",
+      "location": {
+        "file": "src/contracts/contracts.controller.js",
+        "line": 109,
+        "endpoint": "PUT /api/contracts/:id/milestones/:milestoneId"
+      },
+      "description": "The `updateMilestone` controller directly updates milestone fields (including `amount`) without checking whether the caller is the client on the contract. Any authenticated user, including the freelancer or an unrelated user, can inflate the milestone amount before the client funds escrow, or modify other milestone fields at any time.",
+      "evidence": {
+        "request_freelancer": "curl -X PUT /api/contracts/{c_id}/milestones/{m_id} -H 'Authorization: Bearer $FREELANCER' -d '{\"amount\": 99999999, \"title\": \"Freelancer inflated amount\"}' -> 200, amount=99999999",
+        "request_admin": "curl -X PUT /api/contracts/{c_id}/milestones/{m_id} -H 'Authorization: Bearer $ADMIN' -d '{\"amount\": 999999, \"title\": \"Hacked milestone\"}' -> 200"
+      },
+      "reproduction_steps": [
+        "As CLIENT, create a contract with milestone amount=1000",
+        "As FREELANCER, PUT /api/contracts/{id}/milestones/{mid} with body {\"amount\": 99999999}",
+        "Response 200: milestone amount updated to 99999999",
+        "When CLIENT now funds escrow, they will be charged 99999999 instead of 1000"
+      ],
+      "impact": "Freelancer can inflate their milestone payout before the client funds escrow. The client funds the inflated amount if they do not notice the change. Also allows any user to corrupt contract data.",
+      "suggested_fix": "In the updateMilestone controller, load the contract and verify req.user.id === contract.client_id. Block updates on milestones that are already funded or further along in the lifecycle.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f07",
+      "title": "Review creation requires no contract membership — any user can review any contract",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-285",
+      "location": {
+        "file": "src/reviews/reviews.service.js",
+        "line": 110,
+        "endpoint": "POST /api/reviews"
+      },
+      "description": "The `createReview` function verifies the contract exists and prevents self-review but does NOT check whether the reviewer is the client or freelancer on the contract. Any authenticated user can post a public review for any contract referencing any other user as the reviewee, regardless of whether they have any business relationship. Reviews affect the freelancer's public gig rating stats.",
+      "evidence": {
+        "setup": "Contract between CLIENT (ec83b101) and FREELANCER (db734f89). ADMIN (aa154850) is not a party.",
+        "request": "curl -X POST /api/reviews -H 'Authorization: Bearer $ADMIN' -d '{\"contract_id\":\"53d996e0...\",\"reviewee_id\":\"ec83b101...\",\"rating\":5,\"comment\":\"Fake review from admin who was not part of this contract\"}'",
+        "response": "{\"id\":\"09e7b20b...\",\"reviewer_id\":\"aa154850...\",\"rating\":5,...} -> 201 Created",
+        "also_confirmed": "Client reviewed the freelancer on a contract in 'pending' status (before work began)"
+      },
+      "reproduction_steps": [
+        "Note any contract ID and the IDs of both parties",
+        "Authenticate as any user NOT in the contract",
+        "POST to /api/reviews with that contract_id and any reviewee_id",
+        "Review is created and immediately affects gig rating statistics"
+      ],
+      "impact": "Anyone can flood a freelancer with fake 5-star or 1-star reviews, manipulating their public rating. Reviews can be posted before work starts or after contract cancellation. The review system provides no trust guarantee.",
+      "suggested_fix": "In createReview, after fetching the contract, verify: req.reviewer_id must equal contract.client_id or contract.freelancer_id AND the reviewee must be the other party. Also require contract status to be 'completed' before review submission.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f08",
+      "title": "Password reset token not invalidated after use — token reuse within 24-hour window",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-640",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 132,
+        "endpoint": "POST /api/auth/reset-password"
+      },
+      "description": "The `updatePassword` function updates only the password_hash field. It does not clear `reset_token` or `reset_token_expires` in the database. After a successful password reset, the same token remains valid in the DB and can be used again. The only expiry check is the embedded timestamp in the token format (controller: tokenAge > 86400000ms = 24 hours), not the DB `reset_token_expires` field (set to 1 hour). `findByResetToken` also ignores `reset_token_expires`. This means a single intercepted or observed token is reusable for the entire 24-hour window even after the victim has already used it to change their password.",
+      "evidence": {
+        "first_use": "POST /api/auth/reset-password {\"token\":\"mnyrb3bs-5c224932cf876ce3\",\"password\":\"TestPass123!\"} -> 200 Password has been reset successfully",
+        "second_use": "POST /api/auth/reset-password {\"token\":\"mnyrb3bs-5c224932cf876ce3\",\"password\":\"Hacked999!\"} -> 200 Password has been reset successfully",
+        "code_snippet": "async function updatePassword(userId, newPassword) {\n  const password_hash = await bcrypt.hash(newPassword, SALT_ROUNDS);\n  return db('users').where({ id: userId }).update({ password_hash, updated_at: new Date() });\n  // reset_token field is NOT cleared\n}"
+      },
+      "reproduction_steps": [
+        "Request a password reset for a victim account via POST /api/auth/forgot-password",
+        "Obtain the token (e.g. from email interception or mailhog in test)",
+        "Use the token to reset the password: POST /api/auth/reset-password {token, password: 'new1'}",
+        "Use the same token again: POST /api/auth/reset-password {token, password: 'new2'} -> succeeds again",
+        "Repeat until 24-hour embedded timestamp expires"
+      ],
+      "impact": "If an attacker intercepts a reset token (phishing, MitM, email account compromise, SMTP monitoring), they can change the victim's password at any time within 24 hours, even after the legitimate user has already used the token. An attacker can flip-flop the password to lock out the victim.",
+      "suggested_fix": "In updatePassword, also clear the reset token: update({ password_hash, reset_token: null, reset_token_expires: null, updated_at: new Date() }). Also fix findByResetToken to filter WHERE reset_token_expires > NOW().",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f09",
+      "title": "Forgot-password endpoint confirms account existence via distinct HTTP 404 response",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-204",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 136,
+        "endpoint": "POST /api/auth/forgot-password"
+      },
+      "description": "When an email address is not registered, the forgot-password endpoint returns HTTP 404 with message 'No account found with that email address'. When the email exists, it returns HTTP 200 with 'Password reset link sent to your email'. The different status codes and messages allow automated enumeration of all registered email addresses.",
+      "evidence": {
+        "existing_email": "POST /api/auth/forgot-password {\"email\":\"pentester_client_1@test.com\"} -> 200 {\"message\":\"Password reset link sent to your email\"}",
+        "nonexistent_email": "POST /api/auth/forgot-password {\"email\":\"doesnotexist@nobody.com\"} -> 404 {\"message\":\"No account found with that email address\"}",
+        "code_snippet": "if (!user) {\n  return res.status(404).json({ message: 'No account found with that email address' });\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/forgot-password with a known registered email -> HTTP 200",
+        "POST /api/auth/forgot-password with an unknown email -> HTTP 404",
+        "Script a wordlist of email addresses and check HTTP status to enumerate all registered accounts"
+      ],
+      "impact": "Enables bulk email enumeration. Attacker can confirm which email addresses have accounts for targeted phishing, credential stuffing, or account takeover preparation. No rate limiting on this endpoint amplifies the impact.",
+      "suggested_fix": "Always return HTTP 200 with a generic message ('If an account exists for that email, a reset link has been sent') regardless of whether the email is registered. This is the standard industry practice.",
+      "needs_poc": false
+    },
+    {
+      "id": "a06-f10",
+      "title": "authLimiter middleware defined but never applied — login and password-reset endpoints have no per-account brute-force protection",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A06",
+      "cwe": "CWE-307",
+      "location": {
+        "file": "src/middleware/rateLimiter.js",
+        "line": 13,
+        "endpoint": "POST /api/auth/login, POST /api/auth/forgot-password, POST /api/auth/reset-password"
+      },
+      "description": "A `authLimiter` (max 20 requests per 15 minutes) is defined in rateLimiter.js but is never imported or applied anywhere in the application. Only `apiLimiter` (1000 req/15min in development) is applied globally. In production mode the global limit is 200/15min, which still permits targeted account brute-forcing of password and reset-token endpoints. There is also no per-account lockout after repeated failures.",
+      "evidence": {
+        "rateLimiter_js": "const authLimiter = rateLimit({ windowMs: 15*60*1000, max: 20, ... }); module.exports = { apiLimiter, authLimiter, uploadLimiter };",
+        "index_js": "const { apiLimiter } = require('./middleware/rateLimiter'); app.use('/api', apiLimiter); // authLimiter never imported or used",
+        "test_50_logins": "50 rapid POST /api/auth/login requests all returned 401 (wrong password) not 429 (rate limited)"
+      },
+      "reproduction_steps": [
+        "Run 50 rapid login attempts against a known email:",
+        "for i in $(seq 1 50); do curl -s -o /dev/null -w '%{http_code} ' -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"any@test.com\",\"password\":\"guess'$i'\"}'; done",
+        "All responses are 401 (bad credentials), never 429 — no throttling occurs",
+        "Similarly, POST /api/auth/forgot-password can be called 20+ times per minute with no throttle"
+      ],
+      "impact": "Unlimited credential brute-force attempts against any account. Password-reset endpoint can be abused to spam users with reset emails and exhaust tokens. Combined with the 24h token reuse bug (a06-f08), an attacker requesting resets at high rate can generate many valid concurrent tokens.",
+      "suggested_fix": "Apply authLimiter to the auth routes in auth.routes.js: router.post('/login', authLimiter, [...validators], authController.login). Apply the same to /forgot-password and /reset-password. Consider also adding account-level lockout (e.g. 5 failed attempts locks account for 15 minutes).",
+      "needs_poc": false
+    }
+  ]
+}

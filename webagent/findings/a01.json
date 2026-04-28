@@ -1,0 +1,417 @@
+{
+  "agent": "a01-access-control",
+  "target": "http://localhost:3000",
+  "findings": [
+    {
+      "id": "a01-f01",
+      "title": "Unauthenticated GET /api/users/:id/settings exposes private user data including email",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-862",
+      "location": {
+        "file": "src/users/users.routes.js",
+        "line": 15,
+        "endpoint": "GET /api/users/:id/settings"
+      },
+      "description": "The GET route for user settings has no authenticate middleware, while the corresponding PUT route does. Any unauthenticated request can fetch the full settings object for any user by UUID, including email address, phone, bio, location, website, email_verified status, and last_login timestamp.",
+      "evidence": {
+        "request": "curl -s 'http://localhost:3000/api/users/aa154850-6352-4ec8-b288-d398e7cd62ad/settings'",
+        "response_snippet": "{\"settings\":{\"id\":\"aa154850-6352-4ec8-b288-d398e7cd62ad\",\"email\":\"bob.admin@hireflow.com\",\"phone\":null,\"display_name\":\"Bob Martinez\",\"timezone\":\"UTC\",\"bio\":\"Admin team lead. Manages user accounts and platform configuration.\",\"location\":\"Austin, TX\",\"website\":null,\"skills\":[],\"email_verified\":true,\"last_login\":\"2026-04-14T15:05:50.332Z\",\"updated_at\":\"2026-04-14T15:05:50.332Z\"}}",
+        "code_snippet": "router.get('/:id/settings', usersController.getUserSettings);  // no authenticate middleware"
+      },
+      "reproduction_steps": [
+        "Take any valid user UUID (e.g. from the public /api/users list)",
+        "GET http://localhost:3000/api/users/{uuid}/settings with no Authorization header",
+        "Response returns email, phone, last_login, email_verified, and other private fields"
+      ],
+      "impact": "Full PII disclosure for every user on the platform without authentication. Email addresses can be harvested for phishing/spam. last_login reveals activity patterns.",
+      "suggested_fix": "Add authenticate middleware to the GET route: router.get('/:id/settings', authenticate, usersController.getUserSettings). Additionally add an ownership check inside the controller so users can only read their own settings.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f02",
+      "title": "Unauthenticated GET /api/users enumerates all platform users with role disclosure",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-862",
+      "location": {
+        "file": "src/users/users.routes.js",
+        "line": 10,
+        "endpoint": "GET /api/users"
+      },
+      "description": "The user list endpoint requires no authentication. It accepts a role query parameter, allowing unauthenticated enumeration of all users including admins and moderators. The response includes UUIDs, usernames, display names, roles, and public profile data for every active user.",
+      "evidence": {
+        "request": "curl -s 'http://localhost:3000/api/users?role=admin'",
+        "response_snippet": "{\"users\":[{\"id\":\"aa154850-6352-4ec8-b288-d398e7cd62ad\",\"username\":\"bob_admin\",\"display_name\":\"Bob Martinez\",\"role\":\"admin\",...}]}",
+        "code_snippet": "router.get('/', usersController.listUsers);  // no authenticate middleware"
+      },
+      "reproduction_steps": [
+        "GET http://localhost:3000/api/users?role=admin with no Authorization header",
+        "Observe admin/moderator accounts returned with UUIDs",
+        "Those UUIDs can then be used in f01 to fetch their private email addresses"
+      ],
+      "impact": "Enables targeted harvesting of admin/moderator account identifiers. Chained with f01 (settings leak), an attacker can enumerate all admin UUIDs then extract their email addresses for targeted attacks.",
+      "suggested_fix": "Add authenticate middleware. If the public marketplace legitimately needs to list freelancers/clients, restrict the response fields and block role filtering for unauthenticated requests.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f03",
+      "title": "IDOR: Any authenticated user can read any contract by ID",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.controller.js",
+        "line": 28,
+        "endpoint": "GET /api/contracts/:id"
+      },
+      "description": "getContract in the controller fetches the contract by ID without verifying the requesting user is the client or freelancer on that contract. The comment in the code explicitly notes 'we just return the data for the requested ID. The frontend handles showing the appropriate UI for each role.' This is a classic IDOR — the server does no ownership check.",
+      "evidence": {
+        "request": "curl -s -H 'Authorization: Bearer $CLIENT' 'http://localhost:3000/api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9'",
+        "response_snippet": "{\"id\":\"41083638-e2be-42a8-8d0c-31c2883a4eb9\",\"client_id\":\"c74f0574-9830-4b30-829d-f74fb8cce292\",\"freelancer_id\":\"4ce6a098-bb51-46d2-94a6-4fdd38fc417f\",\"title\":\"Negative Override Test\",...,\"milestones\":[...]}",
+        "code_snippet": "const contract = await contractsService.getContractById(req.params.id);\nif (!contract) return res.status(404).json(...);\nres.json(contract);  // no ownership check"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101); this user has no contracts",
+        "GET /api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9",
+        "Observe full contract returned including parties, amounts, milestones, and deliverables"
+      ],
+      "impact": "Any logged-in user can read all contracts on the platform by UUID enumeration, exposing negotiated rates, deliverable content, payment amounts, and counterparty identities.",
+      "suggested_fix": "In getContract, add: if (contract.client_id !== req.user.id && contract.freelancer_id !== req.user.id && !['admin','superadmin','moderator'].includes(req.user.role)) return res.status(403).",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f04",
+      "title": "IDOR: Any authenticated user can update milestone details on any contract",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.controller.js",
+        "line": 109,
+        "endpoint": "PUT /api/contracts/:id/milestones/:milestoneId"
+      },
+      "description": "updateMilestone in the controller only checks that the milestoneId belongs to the contractId. There is no check that the requesting user is the client or freelancer on the contract. An attacker can modify title, description, amount, and due_date of any milestone.",
+      "evidence": {
+        "request": "curl -s -X PUT -H 'Authorization: Bearer $CLIENT' -H 'Content-Type: application/json' -d '{\"title\": \"HACKED milestone\", \"amount\": 1}' 'http://localhost:3000/api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9/milestones/2bcf0112-fd9e-4d9e-bb32-443ea57d312f'",
+        "response_snippet": "{\"id\":\"2bcf0112-fd9e-4d9e-bb32-443ea57d312f\",\"title\":\"HACKED milestone\",\"amount\":1,...}",
+        "code_snippet": "const [milestone] = await require('../config/database')('milestones')\n  .where({ id: milestoneId, contract_id: req.params.id })\n  .update(updates)\n  .returning('*');  // no user ownership check"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101)",
+        "PUT /api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9/milestones/2bcf0112-fd9e-4d9e-bb32-443ea57d312f with body {\"title\": \"HACKED milestone\", \"amount\": 1}",
+        "Response 200 with updated milestone title and amount — milestone was changed to 1 cent"
+      ],
+      "impact": "An attacker can reduce milestone payment amounts to $0.01, alter deliverable titles to corrupt contract terms, or modify due dates to manufacture disputes. Financial fraud vector.",
+      "suggested_fix": "Fetch the contract and verify req.user.id matches client_id or freelancer_id before applying updates.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f05",
+      "title": "IDOR: Any authenticated user can cancel/modify status of any contract",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 150,
+        "endpoint": "PUT /api/contracts/:id/status"
+      },
+      "description": "updateContractStatus in the service accepts a userId parameter but never uses it to check ownership. Any authenticated user who knows a contract UUID can transition it through its state machine (e.g., active->cancelled). An active contract belonging to smoke test users was successfully cancelled.",
+      "evidence": {
+        "request": "curl -s -X PUT -H 'Authorization: Bearer $CLIENT' -H 'Content-Type: application/json' -d '{\"status\": \"cancelled\"}' 'http://localhost:3000/api/contracts/afd6e8f2-1f0b-48e3-a796-9f1085ef4305/status'",
+        "response_snippet": "{\"id\":\"afd6e8f2-1f0b-48e3-a796-9f1085ef4305\",\"client_id\":\"c74f0574-9830-4b30-829d-f74fb8cce292\",\"status\":\"cancelled\",...}",
+        "code_snippet": "async function updateContractStatus(contractId, newStatus, userId) {\n  const contract = await db('contracts').where({ id: contractId }).first();\n  // userId is never checked against contract.client_id or contract.freelancer_id"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101), who is NOT a party to contract afd6e8f2",
+        "PUT /api/contracts/afd6e8f2-1f0b-48e3-a796-9f1085ef4305/status with body {\"status\": \"cancelled\"}",
+        "Response 200 — contract was cancelled even though the caller is unrelated to it"
+      ],
+      "impact": "Attacker can cancel active contracts between other users, disrupting the platform and causing financial harm. Can also mark contracts as disputed to block escrow releases.",
+      "suggested_fix": "In updateContractStatus, add: if (contract.client_id !== userId && contract.freelancer_id !== userId) throw 403.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f06",
+      "title": "IDOR: Any authenticated user can add milestones to any contract",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 204,
+        "endpoint": "POST /api/contracts/:id/milestones"
+      },
+      "description": "addMilestone in the service fetches the contract but never verifies the requesting user is a party to it. An attacker can inject arbitrary milestones with arbitrary amounts into any contract, inflating the total_amount field.",
+      "evidence": {
+        "request": "curl -s -X POST -H 'Authorization: Bearer $CLIENT' -H 'Content-Type: application/json' -d '{\"title\": \"Injected Milestone\", \"amount\": 99999999}' 'http://localhost:3000/api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones'",
+        "response_snippet": "{\"id\":\"60dea6f0-9248-4c4e-8ca7-6ab9b2de8db9\",\"title\":\"Injected Milestone\",\"amount\":99999999,...}",
+        "code_snippet": "async function addMilestone(contractId, milestoneData, userId) {\n  const contract = await db('contracts').where({ id: contractId }).first();\n  // userId never checked against contract.client_id"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101)",
+        "POST /api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones with {\"title\": \"Injected Milestone\", \"amount\": 99999999}",
+        "Response 201 — milestone created, contract total_amount inflated by 99999999 cents"
+      ],
+      "impact": "Attacker can inflate contract values, inject payment obligations, and corrupt contract state for other users.",
+      "suggested_fix": "Verify req.user.id === contract.client_id before inserting the milestone.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f07",
+      "title": "IDOR: Any authenticated user can submit deliverables on any contract milestone",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 253,
+        "endpoint": "POST /api/contracts/:id/milestones/:milestoneId/submit"
+      },
+      "description": "submitDeliverable has no ownership check. Any authenticated user can submit deliverables on any milestone in a funded state, advancing the milestone status to 'submitted' and triggering notification emails to the client.",
+      "evidence": {
+        "request": "curl -s -X POST -H 'Authorization: Bearer $CLIENT' -H 'Content-Type: application/json' -d '{\"message\": \"IDOR - deliverable submitted by non-party\"}' 'http://localhost:3000/api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones/7247925c-d095-4af6-8789-090a06c14722/submit'",
+        "response_snippet": "{\"id\":\"7247925c-d095-4af6-8789-090a06c14722\",\"status\":\"submitted\",\"submitted_by\":\"ec83b101-7215-4ad3-962c-18dc6d6c4c54\",...}",
+        "code_snippet": "// submitDeliverable never checks contract.freelancer_id === userId"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101)",
+        "POST /api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones/7247925c-d095-4af6-8789-090a06c14722/submit with {\"message\": \"IDOR test\"}",
+        "Response 200 — milestone status changed to submitted, deliverable recorded under attacker's ID"
+      ],
+      "impact": "Attacker can impersonate the freelancer, marking their own work as submitted to prematurely trigger client review and escrow release. Can also flood deliverables with spam content.",
+      "suggested_fix": "Verify req.user.id === contract.freelancer_id before accepting the submission.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f08",
+      "title": "IDOR: Any authenticated user can request milestone revision on any contract",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.service.js",
+        "line": 344,
+        "endpoint": "PUT /api/contracts/:id/milestones/:milestoneId/request-revision"
+      },
+      "description": "requestRevision has no ownership check. Any authenticated user can request a revision on any submitted milestone in any contract, permanently altering its status to revision_requested and blocking escrow release.",
+      "evidence": {
+        "request": "curl -s -X PUT -H 'Authorization: Bearer $FREELANCER' -H 'Content-Type: application/json' -d '{\"reason\": \"IDOR revision request\"}' 'http://localhost:3000/api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones/7247925c-d095-4af6-8789-090a06c14722/request-revision'",
+        "response_snippet": "{\"id\":\"7247925c-d095-4af6-8789-090a06c14722\",\"status\":\"revision_requested\",...}",
+        "code_snippet": "// requestRevision never checks contract.client_id === userId"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_free_1 (db734f89), not a party to contract 9d2f47b6",
+        "PUT /api/contracts/9d2f47b6-b82d-4965-997b-54a5ef66353b/milestones/7247925c-d095-4af6-8789-090a06c14722/request-revision",
+        "Response 200 — milestone status changed to revision_requested, blocking escrow release"
+      ],
+      "impact": "Attacker can indefinitely block freelancer payment by cycling milestones between submitted and revision_requested states.",
+      "suggested_fix": "Verify req.user.id === contract.client_id before processing revision request.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f09",
+      "title": "IDOR: Any authenticated user can retrieve PDF invoice for any contract",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/contracts/contracts.controller.js",
+        "line": 220,
+        "endpoint": "GET /api/contracts/:id/invoice"
+      },
+      "description": "getInvoice calls contractsService.generateInvoice with only the contract ID from the URL, with no check that the requesting user is a party to the contract. Any authenticated user can download the PDF invoice for any contract.",
+      "evidence": {
+        "request": "curl -s -H 'Authorization: Bearer $CLIENT' 'http://localhost:3000/api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9/invoice' -o /tmp/invoice.pdf && file /tmp/invoice.pdf",
+        "response_snippet": "PDF document received (1 page) with contract financial details",
+        "code_snippet": "exports.getInvoice = async (req, res, next) => {\n  const { pdf, invoiceData } = await contractsService.generateInvoice(req.params.id);\n  // no ownership check before generating"
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_client_1 (ec83b101)",
+        "GET /api/contracts/41083638-e2be-42a8-8d0c-31c2883a4eb9/invoice",
+        "Response 200 application/pdf — full invoice PDF returned for a contract owned by different users"
+      ],
+      "impact": "Financial document disclosure: payment amounts, party names, invoice numbers, and bank/payout details exposed to unauthorized users.",
+      "suggested_fix": "Add ownership check: fetch the contract, verify req.user.id is client_id or freelancer_id before generating the invoice.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f10",
+      "title": "IDOR: Any authenticated user can read messages in any conversation",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/messaging/messaging.service.js",
+        "line": 187,
+        "endpoint": "GET /api/messages/conversations/:id"
+      },
+      "description": "getMessages in the service takes a conversationId and returns all messages without checking that the requesting user is a participant in the conversation. An attacker who knows a conversation UUID can read its full message history.",
+      "evidence": {
+        "request": "curl -s -H 'Authorization: Bearer $CLIENT' 'http://localhost:3000/api/messages/conversations/b5e05356-8a59-4d5e-b0b5-b557ad9b219e'",
+        "response_snippet": "{\"messages\":[{\"content\":\"This is a private message between mod and admin\",\"sender_id\":\"51ec3400-4570-4583-9f6d-041f2a1da2dc\",...}]}",
+        "code_snippet": "function getMessages(conversationId, page, limit) {\n  return db('messages as m')\n    .join('users as u', 'u.id', 'm.sender_id')\n    .where('m.conversation_id', conversationId)  // no participant check"
+      },
+      "reproduction_steps": [
+        "Create a private conversation between moderator and admin (IDs known from recon)",
+        "Authenticate as pentester_client_1 (ec83b101), who is not a participant",
+        "GET /api/messages/conversations/b5e05356-8a59-4d5e-b0b5-b557ad9b219e",
+        "Response 200 returns full message content of the private conversation"
+      ],
+      "impact": "Full message content disclosure across all platform conversations. An attacker can read private business negotiations, dispute details, or admin coordination messages.",
+      "suggested_fix": "Before calling getMessages, verify the requesting user is in conversation_participants for the given conversationId.",
+      "needs_poc": true
+    },
+    {
+      "id": "a01-f11",
+      "title": "IDOR: Any authenticated user can send messages in any conversation",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/messaging/messaging.controller.js",
+        "line": 64,
+        "endpoint": "POST /api/messages/conversations/:id/messages"
+      },
+      "description": "sendMessage sets sender_id from req.user.id but never verifies the user is a participant in the target conversation. The message is inserted and a socket event is emitted to all participants.",
+      "evidence": {
+        "request": "curl -s -X POST -H 'Authorization: Bearer $CLIENT' -H 'Content-Type: application/json' -d '{\"content\": \"IDOR injection into private conversation\"}' 'http://localhost:3000/api/messages/conversations/b5e05356-8a59-4d5e-b0b5-b557ad9b219e/messages'",
+        "response_snippet": "201 Created — message inserted with sender_id = ec83b101 (pentester_client_1)",
+        "code_snippet": "// sendMessage does not check conversation_participants before inserting"
+      },
+      "reproduction_steps": [
+        "Use the same conversation ID as f10",
+        "POST /api/messages/conversations/b5e05356-8a59-4d5e-b0b5-b557ad9b219e/messages with any content",
+        "Response 201 — message delivered to admin and moderator's real-time feed"
+      ],
+      "impact": "Message injection: attacker can impersonate system messages or inject instructions into administrative/dispute conversations to manipulate outcomes.",
+      "suggested_fix": "Check conversation_participants before inserting any message.",
+      "needs_poc": true
+    },
+    {
+      "id": "a01-f12",
+      "title": "IDOR: Authenticated user can read any other user's proposal details",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-639",
+      "location": {
+        "file": "src/proposals/proposals.controller.js",
+        "line": 9,
+        "endpoint": "GET /api/proposals"
+      },
+      "description": "getProposals accepts a freelancer_id query parameter and returns all matching proposals without checking that req.user.id matches the requested freelancer_id. Any authenticated user (client, freelancer, moderator) can read the full proposal content, bid amounts, and cover letters of any other freelancer.",
+      "evidence": {
+        "request": "curl -s -H 'Authorization: Bearer $FREELANCER' 'http://localhost:3000/api/proposals?freelancer_id=f9dcdbca-01eb-4b6b-810e-039c2def9de1'",
+        "response_snippet": "{\"data\":[{\"id\":\"29d37c93...\",\"cover_letter\":\"I am a very experienced developer...\",\"bid_amount\":50000,...}]}",
+        "code_snippet": "var result = await proposalService.getProposals({\n  freelancer_id: freelancerId,  // no ownership check against req.user.id\n  ..."
+      },
+      "reproduction_steps": [
+        "Authenticate as pentester_free_1 (db734f89)",
+        "GET /api/proposals?freelancer_id=f9dcdbca-01eb-4b6b-810e-039c2def9de1 (a different freelancer)",
+        "Response 200 returns full proposal with cover letter and bid amount"
+      ],
+      "impact": "Competitive intelligence: freelancers can read competitors' bid amounts and cover letters, allowing them to undercut bids on shared projects.",
+      "suggested_fix": "In getProposals, if freelancer_id is provided and req.user.role === 'freelancer', verify req.user.id === freelancer_id. Clients should only see proposals for their own projects.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f13",
+      "title": "CORS wildcard-equivalent origin reflection with credentials enabled",
+      "severity": "high",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-942",
+      "location": {
+        "file": "src/index.js",
+        "line": null,
+        "endpoint": "All /api/* endpoints"
+      },
+      "description": "The CORS configuration uses origin: process.env.CORS_ORIGIN || true (defaults to true in development), which causes Express to reflect the caller's Origin header back verbatim in Access-Control-Allow-Origin, combined with Access-Control-Allow-Credentials: true. This effectively grants any origin the ability to make credentialed cross-origin requests.",
+      "evidence": {
+        "request": "curl -si -H 'Origin: https://evil.com' http://localhost:3000/api/auth/me",
+        "response_snippet": "Access-Control-Allow-Origin: https://evil.com\nAccess-Control-Allow-Credentials: true",
+        "code_snippet": "cors({ origin: process.env.CORS_ORIGIN || true, credentials: true })"
+      },
+      "reproduction_steps": [
+        "Send any request to /api/* with Origin: https://evil.com",
+        "Observe Access-Control-Allow-Origin: https://evil.com and Access-Control-Allow-Credentials: true in response",
+        "A malicious page at evil.com can use fetch() with credentials to call any API endpoint as the victim user"
+      ],
+      "impact": "Any malicious website can perform authenticated API requests on behalf of logged-in users. Combined with the IDOR vulnerabilities above, this creates a complete account takeover / data exfiltration chain.",
+      "suggested_fix": "Set CORS_ORIGIN to an explicit allowlist of legitimate frontend origins. Never combine credentials: true with a reflected origin.",
+      "needs_poc": true
+    },
+    {
+      "id": "a01-f14",
+      "title": "Unauthenticated /api/debug/info exposes internal infrastructure details",
+      "severity": "medium",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-200",
+      "location": {
+        "file": "src/index.js",
+        "line": null,
+        "endpoint": "GET /api/debug/info"
+      },
+      "description": "The debug endpoint is accessible without any authentication and returns Node.js version, PID, memory stats, environment name, and internal hostnames for the PostgreSQL, MongoDB, and Redis services.",
+      "evidence": {
+        "request": "curl -s 'http://localhost:3000/api/debug/info'",
+        "response_snippet": "{\"node_version\":\"v20.20.2\",\"environment\":\"development\",\"uptime\":488,\"memory\":{\"rss\":113745920,...},\"db_host\":\"postgres\",\"redis_host\":\"redis\",\"mongo_uri\":\"mongodb://mongodb:27017/hireflow\"}",
+        "code_snippet": "app.get('/api/debug/info', (req, res) => { res.json({ ... db_host, redis_host, mongo_uri }); });"
+      },
+      "reproduction_steps": [
+        "GET http://localhost:3000/api/debug/info with no Authorization header",
+        "Response 200 returns full infrastructure details"
+      ],
+      "impact": "Exposes internal service hostnames and ports useful for lateral movement. MongoDB URI reveals no authentication is configured on the MongoDB instance.",
+      "suggested_fix": "Remove the endpoint entirely, or protect it with requireAdmin and only enable it in non-production environments.",
+      "needs_poc": false
+    },
+    {
+      "id": "a01-f15",
+      "title": "Missing authentication middleware on GET /api/users/:id and GET /api/users/:id/stats",
+      "severity": "low",
+      "confidence": "confirmed",
+      "category": "A01",
+      "cwe": "CWE-862",
+      "location": {
+        "file": "src/users/users.routes.js",
+        "line": 11,
+        "endpoint": "GET /api/users/:id, GET /api/users/:id/stats"
+      },
+      "description": "Profile and stats endpoints require no authentication and return role, bio, location, skills, creation date, earnings stats, and contract counts for any user. While some of this may be intentionally public (marketplace profile pages), the combination of role exposure and stats without auth enables reconnaissance.",
+      "evidence": {
+        "request": "curl -s 'http://localhost:3000/api/users/aa154850-6352-4ec8-b288-d398e7cd62ad'",
+        "response_snippet": "{\"user\":{\"id\":\"aa154850...\",\"role\":\"admin\",\"display_name\":\"Bob Martinez\",...}}",
+        "code_snippet": "router.get('/:id', usersController.getUser);  // no authenticate"
+      },
+      "reproduction_steps": [
+        "GET /api/users/{admin-uuid} with no auth",
+        "Response 200 confirms admin role and profile details"
+      ],
+      "impact": "Low on its own; amplified when chained with f01 and f02 for targeted phishing of admin accounts.",
+      "suggested_fix": "Evaluate whether role field should be returned in public profiles. Consider requiring authentication to view full profiles, or at minimum remove role from the public response.",
+      "needs_poc": false
+    }
+  ],
+  "coverage_notes": "Tested all endpoints listed in the task scope. Confirmed IDORs on every contract sub-operation (GET, status update, add milestone, update milestone, submit deliverable, request revision, invoice). Confirmed messaging IDORs (read and write). Confirmed unauthenticated settings and user list endpoints. Tested admin endpoint vertical escalation (all correctly blocked for client/freelancer). Tested role escalation via registration (blocked) and profile update (whitelist prevents it). Tested CORS misconfiguration. Tested auth middleware for unexpected JWT error bypass (not exploitable — server returns 401 for all malformed tokens tested). The auth middleware silent next() fallback (line 36) is only reachable if jwt.verify throws something besides JsonWebTokenError/TokenExpiredError, which would require an unusual runtime condition; not exploitable through standard request manipulation.",
+  "blind_spots": [
+    "Did not find a funded/approved milestone to test escrow release IDOR (all existing approved milestones were already in 'released' state). Code review shows the same pattern — no ownership check in releaseEscrow would produce a false 403 since it correctly checks contract.client_id. Actually releaseEscrow DOES check ownership (line 223 in payments.service.js), unlike the contract controller operations.",
+    "Could not test approveMilestone IDOR on a submitted milestone (milestone found was in 'funded' not 'submitted' state). Code review shows no ownership check in approveMilestone service method.",
+    "Did not test the admin updateUser endpoint for role escalation with an actual admin token (moderator correctly blocked). An admin token could potentially promote a user to admin role.",
+    "Superadmin account (alice.admin) was inaccessible so could not test superadmin-only endpoints like /api/admin/audit-log and PUT /api/admin/settings."
+  ]
+}
